@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arms_planner_gui"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "arms_planner_core>=0.1.0",
+    "viser>=0.2.0,<1.0.0",
+    "numpy>=1.26",
+    "pywebview>=4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["arms_planner_gui*"]

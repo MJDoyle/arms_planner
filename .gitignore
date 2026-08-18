@@ -1,0 +1,41 @@
+# ── C++ build ────────────────────────────────────────────────────────────────
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.so
+
+# ── Python ────────────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.egg
+
+# ── Planning outputs (generated — can be large) ───────────────────────────────
+# Entire output trees produced by arms-plan; regenerate with `arms plan`
+arms_output/
+input_models/arms_output/
+
+# Individual generated artefacts (in case they land outside an arms_output/ dir)
+*.arms
+*.gcode
+*_assembly_cache.yaml
+assembly_plan.yaml
+jig_*.stl
+internal_part_*.stl
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
