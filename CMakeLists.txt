@@ -11,7 +11,6 @@ add_compile_options(-Wno-deprecated-declarations)
 
 find_package(OpenCASCADE REQUIRED)
 find_package(yaml-cpp REQUIRED)
-find_package(coal REQUIRED)
 find_package(Boost REQUIRED COMPONENTS json)
 
 # ---- arms_planner_core_lib (no ROS, no PIC restriction) ----
@@ -35,7 +34,7 @@ add_library(arms_planner_core_lib STATIC
   src/Config.cpp
   src/Tessellator.cpp
   src/SceneModel.cpp
-  src/CoalAdapter.cpp
+  src/OcctCollisionAdapter.cpp
   src/GlbWriter.cpp
   include/assembler/quickhull/QuickHull.cpp
 )
@@ -49,7 +48,6 @@ target_include_directories(arms_planner_core_lib PUBLIC
 target_link_libraries(arms_planner_core_lib PUBLIC
   ${OpenCASCADE_LIBRARIES}
   yaml-cpp::yaml-cpp
-  coal::coal
 )
 
 # Required when the static lib is linked into a shared object (assembler_node.so)

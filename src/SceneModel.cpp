@@ -3,12 +3,13 @@
 #include <stdexcept>
 
 void SceneModel::add_object(const std::string& id,
-                            std::shared_ptr<MeshAsset> mesh,
+                            std::shared_ptr<MeshAsset>    mesh,
+                            std::shared_ptr<TopoDS_Shape> shape,
                             SceneRole role,
                             const gp_Trsf& pose,
                             bool present)
 {
-    objects_[id] = SceneObject{mesh, role, pose, present};
+    objects_[id] = SceneObject{mesh, shape, role, pose, present};
 }
 
 void SceneModel::remove_object(const std::string& id)

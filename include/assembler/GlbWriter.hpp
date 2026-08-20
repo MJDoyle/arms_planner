@@ -11,6 +11,10 @@ size_t write_glb(const MeshAsset& mesh, const std::string& path);
 // Serialise mesh to a GLB byte buffer (same content as write_glb but in memory).
 std::vector<uint8_t> mesh_to_glb(const MeshAsset& mesh);
 
+// Like mesh_to_glb but embeds a PBR material with the given base colour (linear RGBA).
+std::vector<uint8_t> mesh_to_glb_coloured(const MeshAsset& mesh,
+                                           float r, float g, float b, float a = 1.0f);
+
 // Deserialise a GLB byte buffer produced by mesh_to_glb() back into a MeshAsset.
 // Only understands the specific format written by mesh_to_glb (float32 POSITION,
 // uint32 indices, single mesh, no extras).  Throws std::runtime_error on format errors.

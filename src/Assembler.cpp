@@ -1,5 +1,5 @@
 #include "assembler/Assembler.hpp"
-#include "assembler/CoalAdapter.hpp"
+#include "assembler/OcctCollisionAdapter.hpp"
 #include "assembler/Tessellator.hpp"
 
 #include "assembler/Assembly.hpp"
@@ -65,6 +65,7 @@ void Assembler::reset()
     scene_.clear();
     collision_adapter_.reset();
     nozzle_mesh_.reset();
+    nozzle_shape_.reset();
 
     initialisePartBays();
 }
@@ -1011,13 +1012,16 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
     const std::string part_id = part->getName() + "_" + std::to_string(part->getId());
     const gp_Pnt assembly_centroid = assembled.at(part);  // mm
 
-    // ---- Coal z-step lift (all parts) ----
+    // ---- z-step lift collision check (all parts) ----
     // Skipped entirely when the user has set a non-zero collision volume threshold,
     // which signals deliberately generous collision handling.
     if (collision_volume_threshold_ == 0.0)
     {
         const double STEP_MM = 1.0;
         const int    N_STEPS = 5;
+
+        auto part_lf_shape = std::make_shared<TopoDS_Shape>(
+            LocalFrameShapeM(*part->getShape()));
 
         bool z_ok = true;
         for (int step = 1; step <= N_STEPS && z_ok; ++step)
@@ -1027,12 +1031,12 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
                 assembly_centroid.X() * 0.001,
                 assembly_centroid.Y() * 0.001,
                 (assembly_centroid.Z() + step * STEP_MM) * 0.001));
-            collision_adapter_->add_or_update(part_id, part->get_mesh_asset(), lifted);
+            collision_adapter_->add_or_update(part_id, part_lf_shape, lifted);
 
             for (auto const& [other, _] : assembled)
             {
                 if (other->getId() == part->getId()) continue;
-                if (!other->get_mesh_asset()) continue;
+                if (!other->getShape()) continue;
                 const std::string other_id = other->getName() + "_" + std::to_string(other->getId());
                 if (!collision_adapter_->collision_free(part_id, other_id))
                 {
@@ -1049,7 +1053,7 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
                 assembly_centroid.X() * 0.001,
                 assembly_centroid.Y() * 0.001,
                 assembly_centroid.Z() * 0.001));
-            collision_adapter_->add_or_update(part_id, part->get_mesh_asset(), original);
+            collision_adapter_->add_or_update(part_id, part_lf_shape, original);
         }
 
         if (!z_ok) return std::nullopt;
@@ -1058,7 +1062,7 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
     // Non-external parts: z-step is sufficient.
     if (part->getType() != Part::EXTERNAL) return gp_Pnt(0, 0, 0);
     if (!generate_grasps_)                 return gp_Pnt(0, 0, 0);
-    if (!nozzle_mesh_)                     return gp_Pnt(0, 0, 0);
+    if (!nozzle_shape_)                    return gp_Pnt(0, 0, 0);
 
     // ---- Grasp search (external parts) ----
     // VacuumGraspGenerator checks nozzle vs part body AND vs assembled parts.
@@ -1071,7 +1075,7 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
     }
 
     auto grasp_opt = VacuumGraspGenerator::generate(
-        part, *collision_adapter_, nozzle_mesh_, assembled_ids);
+        part, *collision_adapter_, nozzle_shape_, assembled_ids);
 
     if (!grasp_opt) return std::nullopt;
     const gp_Pnt grasp = *grasp_opt;
@@ -1188,13 +1192,15 @@ void Assembler::generateInitialAssembly()
     // Pre-assign bay positions for external parts so they are available during DFS.
     assignExternalBayPositions();
 
-    // Move shapes to their assembly positions — Coal poses and OCCT face queries
-    // inside VacuumGraspGenerator must be consistent during DFS.
+    // Move shapes to their assembly positions — OCCT face queries inside
+    // VacuumGraspGenerator must be consistent during DFS.
     target_assembly_->setPartTransforms();
 
-    // Tessellate the vacuum nozzle once for use in edge_feasible and generate().
+    // Load the vacuum nozzle once for use in edge_feasible and generate().
     // Try to load from the user-supplied STEP file first; fall back to a
     // 4.2 mm radius × 20 mm cylinder if the file is absent or unreadable.
+    // raw_nozzle keeps the mm-space shape before local-frame conversion.
+    TopoDS_Shape raw_nozzle;
     if (!tool_config_.mesh_file.empty()) {
         STEPControl_Reader reader;
         if (reader.ReadFile(tool_config_.mesh_file.c_str()) == IFSelect_RetDone) {
@@ -1202,6 +1208,7 @@ void Assembler::generateInitialAssembly()
             TopoDS_Shape shape = reader.OneShape();
             if (!shape.IsNull()) {
                 nozzle_mesh_ = Tessellator::tessellate(shape, MESH_DEFLECTION_MM);
+                raw_nozzle   = shape;
                 RCLCPP_INFO(logger(), "Nozzle mesh loaded from '%s': %zu verts, %zu tris",
                             tool_config_.mesh_file.c_str(),
                             nozzle_mesh_->vertices.size(),
@@ -1214,16 +1221,19 @@ void Assembler::generateInitialAssembly()
     }
     if (!nozzle_mesh_) {
         // Fallback: radius 4.2 mm, height 20 mm, bottom at z=0, centroid at z=10.
-        TopoDS_Shape nozzle_shape =
-            BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(0,0,0), gp_Dir(0,0,1)), 4.2, 20.0).Shape();
-        nozzle_mesh_ = Tessellator::tessellate(nozzle_shape, MESH_DEFLECTION_MM);
+        raw_nozzle  = BRepPrimAPI_MakeCylinder(
+            gp_Ax2(gp_Pnt(0,0,0), gp_Dir(0,0,1)), 4.2, 20.0).Shape();
+        nozzle_mesh_ = Tessellator::tessellate(raw_nozzle, MESH_DEFLECTION_MM);
     }
 
-    // Align the nozzle mesh so its contact face (min-z vertex) sits at exactly
-    // z = -0.01 m in local frame.  VacuumGraspGenerator and edge_feasible both
-    // place the nozzle origin at face_z + GAP + NOZZLE_H_HALF and expect the
-    // mesh bottom to be 0.01 m below that origin.  The cylinder satisfies this
-    // by construction; loaded STEP geometry may not.
+    // Convert nozzle to local-frame metres for collision (same convention as
+    // Tessellator: bbox centroid at origin, mm → m).
+    nozzle_shape_ = std::make_shared<TopoDS_Shape>(LocalFrameShapeM(raw_nozzle));
+
+    // Align the nozzle so its contact face (min-z) sits at exactly z = -0.01 m.
+    // VacuumGraspGenerator places the nozzle origin at face_z + GAP + NOZZLE_H_HALF
+    // and expects the bottom to be 0.01 m below that origin.  The cylinder satisfies
+    // this by construction; loaded STEP geometry may not.
     {
         double min_z = std::numeric_limits<double>::max();
         for (const auto& v : nozzle_mesh_->vertices)
@@ -1233,14 +1243,16 @@ void Assembler::generateInitialAssembly()
         if (std::abs(shift) > 1e-6) {
             for (auto& v : nozzle_mesh_->vertices)
                 v[2] += shift;
-            RCLCPP_INFO(logger(), "Nozzle mesh z-shifted %.2f mm to align contact face",
+            gp_Trsf z_adj;
+            z_adj.SetTranslation(gp_Vec(0.0, 0.0, shift));
+            *nozzle_shape_ = BRepBuilderAPI_Transform(*nozzle_shape_, z_adj, true).Shape();
+            RCLCPP_INFO(logger(), "Nozzle z-shifted %.2f mm to align contact face",
                         shift * 1000.0);
         }
     }
 
     // Apply the per-tool XYZ correction from the tool config (mm → m).
-    // This corrects any lateral offset visible when the mesh is displayed in
-    // the visualisation relative to the part geometry.
+    // This corrects any lateral offset visible in the visualisation.
     {
         const double dx = tool_config_.offset_x_mm * 0.001;
         const double dy = tool_config_.offset_y_mm * 0.001;
@@ -1251,7 +1263,10 @@ void Assembler::generateInitialAssembly()
                 v[1] += dy;
                 v[2] += dz;
             }
-            RCLCPP_INFO(logger(), "Nozzle mesh offset applied: (%.2f, %.2f, %.2f) mm",
+            gp_Trsf xyz_adj;
+            xyz_adj.SetTranslation(gp_Vec(dx, dy, dz));
+            *nozzle_shape_ = BRepBuilderAPI_Transform(*nozzle_shape_, xyz_adj, true).Shape();
+            RCLCPP_INFO(logger(), "Nozzle offset applied: (%.2f, %.2f, %.2f) mm",
                         tool_config_.offset_x_mm,
                         tool_config_.offset_y_mm,
                         tool_config_.offset_z_mm);
@@ -1263,7 +1278,7 @@ void Assembler::generateInitialAssembly()
     scene_.clear();
     for (auto const& [part, transform] : target_assembly_->getAssembledPartTransforms())
     {
-        if (!part->get_mesh_asset()) continue;
+        if (!part->getShape()) continue;
 
         gp_Trsf pose;
         pose.SetTranslation(gp_Vec(transform.X() * 0.001,
@@ -1271,14 +1286,15 @@ void Assembler::generateInitialAssembly()
                                    transform.Z() * 0.001));
 
         const std::string id = part->getName() + "_" + std::to_string(part->getId());
-        scene_.add_object(id, part->get_mesh_asset(), SceneRole::Part, pose, true);
+        auto lf_shape = std::make_shared<TopoDS_Shape>(LocalFrameShapeM(*part->getShape()));
+        scene_.add_object(id, part->get_mesh_asset(), lf_shape, SceneRole::Part, pose, true);
     }
 
     const double safety_margin_m = MESH_DEFLECTION_MM * 0.5 * 0.001;
-    collision_adapter_ = std::make_unique<CoalAdapter>(safety_margin_m);
+    collision_adapter_ = std::make_unique<OcctCollisionAdapter>(safety_margin_m);
     collision_adapter_->sync(scene_);
 
-    RCLCPP_INFO(logger(), "SceneModel built with %zu objects (safety margin %.4f mm)",
+    RCLCPP_INFO(logger(), "SceneModel built with %zu objects (OCCT, safety margin %.4f mm)",
                 scene_.present_object_ids().size(),
                 safety_margin_m * 1000.0);
 }
@@ -1320,18 +1336,15 @@ void Assembler::generateNegatives()
 
         part->setCentroidPosition(gp_Pnt(transform.X(), transform.Y(), JIG_CENTER_Z));
 
-        CradleGenerator cradle_gen(part->getName(), *part->getShape());
+        CradleGenerator cradle_gen(part->getName(), *part->getShape(), cradle_scaling_distance_);
 
         float part_jig_z_offset = cradle_gen.createSimpleNegative(BAY_SIZES[part->getBaySizeIndex()], part->getBayIndex(), run_output_dir_);
 
-        RCLCPP_INFO(logger(), "Jig z offset (height above jig base): %f", part_jig_z_offset);
+        RCLCPP_INFO(logger(), "Jig z offset: %f", part_jig_z_offset);
 
-        RCLCPP_INFO(logger(), "Setting part transform %f %f %f", transform.X(), transform.Y(), (double)part_jig_z_offset);
+        RCLCPP_INFO(logger(), "Setting part transform %f %f %f", transform.X(), transform.Y(), JIG_CENTER_Z + part_jig_z_offset);
 
-        // part_jig_z_offset is the part centroid height above the jig base plate (Z=0 in
-        // the STL).  The jig base is at Z=0 in world coordinates, so no additional offset
-        // is needed — using JIG_CENTER_Z here would shift parts below the jig.
-        initial_assembly_->setUnassembledPart(part, gp_Pnt(transform.X(), transform.Y(), part_jig_z_offset));
+        initial_assembly_->setUnassembledPart(part, gp_Pnt(transform.X(), transform.Y(), JIG_CENTER_Z + part_jig_z_offset));
 
     }
 }
@@ -1343,9 +1356,9 @@ void Assembler::generateNegatives()
 */
 void Assembler::generateGrasps()
 {
-    if (!collision_adapter_ || !nozzle_mesh_) return;
+    if (!collision_adapter_ || !nozzle_shape_) return;
 
-    // Ensure shapes are at assembly positions for consistent Coal / OCCT queries.
+    // Ensure shapes are at assembly positions for consistent OCCT queries.
     target_assembly_->setPartTransforms();
 
     const auto& all_parts = target_assembly_->getAssembledPartTransforms();
@@ -1366,7 +1379,7 @@ void Assembler::generateGrasps()
         }
 
         auto grasp = VacuumGraspGenerator::generate(
-            part, *collision_adapter_, nozzle_mesh_, assembled_ids);
+            part, *collision_adapter_, nozzle_shape_, assembled_ids);
 
         if (grasp)
             part->setVacuumGrasp(*grasp);
@@ -1379,7 +1392,7 @@ void Assembler::generateGrasps()
 std::vector<GraspAttempt> Assembler::debugGrasps()
 {
     std::vector<GraspAttempt> all_attempts;
-    if (!collision_adapter_ || !nozzle_mesh_ || !target_assembly_) return all_attempts;
+    if (!collision_adapter_ || !nozzle_shape_ || !target_assembly_) return all_attempts;
 
     target_assembly_->setPartTransforms();
 
@@ -1398,7 +1411,7 @@ std::vector<GraspAttempt> Assembler::debugGrasps()
         }
 
         VacuumGraspGenerator::generate(
-            part, *collision_adapter_, nozzle_mesh_, assembled_ids, &all_attempts);
+            part, *collision_adapter_, nozzle_shape_, assembled_ids, &all_attempts);
     }
 
     return all_attempts;

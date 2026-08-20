@@ -6,7 +6,8 @@
 #include <limits>
 
 // ---------------------------------------------------------------------------
-// Vacuum grasp search using Coal BVH for all collision checks.
+// Vacuum grasp search using OCCT BRepExtrema_DistShapeShape for all collision
+// checks (via OcctCollisionAdapter).
 //
 // Algorithm:
 //   For each planar, upward-facing face with sufficient area:
@@ -18,7 +19,7 @@
 //       (b) nozzle is collision-free with every assembled-part ID
 //   Among all accepted candidates, return the one closest to the CoM.
 //
-// Nozzle geometry (matches VacuumGraspGenerator legacy dimensions):
+// Nozzle geometry:
 //   radius 4.2 mm, height 20 mm, local-frame centroid at origin,
 //   bottom at z = -10 mm, top at z = +10 mm.
 //
@@ -29,13 +30,13 @@
 // ---------------------------------------------------------------------------
 
 std::optional<gp_Pnt> VacuumGraspGenerator::generate(
-    std::shared_ptr<Part>              part,
-    CollisionAdapter&                  adapter,
-    const std::shared_ptr<MeshAsset>&  nozzle_mesh,
-    const std::vector<std::string>&    assembled_ids,
-    std::vector<GraspAttempt>*         debug_out)
+    std::shared_ptr<Part>                part,
+    CollisionAdapter&                    adapter,
+    const std::shared_ptr<TopoDS_Shape>& nozzle_shape,
+    const std::vector<std::string>&      assembled_ids,
+    std::vector<GraspAttempt>*           debug_out)
 {
-    if (!nozzle_mesh)
+    if (!nozzle_shape)
         return std::nullopt;
 
     TopoDS_Shape shape = *(part->getShape());
@@ -91,7 +92,7 @@ std::optional<gp_Pnt> VacuumGraspGenerator::generate(
                 // Pose in metres (Tessellator stores local-frame mesh with centroid at origin).
                 gp_Trsf pose;
                 pose.SetTranslation(gp_Vec(nx * 0.001, ny * 0.001, nozzle_cen_z_mm * 0.001));
-                adapter.add_or_update("__grasp_nozzle__", nozzle_mesh, pose);
+                adapter.add_or_update("__grasp_nozzle__", nozzle_shape, pose);
 
                 // (a) Nozzle body must not intersect the part.
                 bool body_clear = adapter.collision_free("__grasp_nozzle__", part_id);

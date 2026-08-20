@@ -1,0 +1,14 @@
+# Background models to bake into the .arms scene output.
+# One entry per line: path,r,g,b,x,y,z,qx,qy,qz,qw
+# (same format as the ROS2 background_models launch parameter)
+# Lines beginning with '#' and blank lines are ignored.
+# Pose units: mm for translation, unit quaternion for rotation.
+
+/home/md/dev/arms_ros2_ws/arms_model/Self-Release Bed - Bed Frame X-1.STL,0.1,0.1,0.1,610,0,-81,0,0.7071,0.7071,0
+/home/md/dev/arms_ros2_ws/arms_model/Self-Release Bed - Bed Frame X-2.STL,0.1,0.1,0.1,610,0,-81,0,0.7071,0.7071,0
+/home/md/dev/arms_ros2_ws/arms_model/Self-Release Bed - Bed Frame Y-1.STL,0.1,0.1,0.1,610,0,-81,0,0.7071,0.7071,0
+/home/md/dev/arms_ros2_ws/arms_model/Self-Release Bed - Bed Frame Y-2.STL,0.1,0.1,0.1,610,0,-81,0,0.7071,0.7071,0
+/home/md/dev/arms_ros2_ws/arms_model/Self-Release Bed - Bed Frame Y-3.STL,0.1,0.1,0.1,610,0,-81,0,0.7071,0.7071,0
+/home/md/dev/arms_ros2_ws/arms_model/Self-Release Bed - Heat Spreader-1.STL,0.8,0.8,0.8,610,0,-81,0,0.7071,0.7071,0
+/home/md/dev/arms_ros2_ws/arms_model/Self-Release Bed - SRB Base Plate-1.STL,0.6,0.6,0.6,610,0,-81,0,0.7071,0.7071,0
+/home/md/dev/arms_ros2_ws/arms_model/Self-Release Bed - Touch Probe-1.STL,0.9,0.95,0.95,610,0,-81,0,0.7071,0.7071,0

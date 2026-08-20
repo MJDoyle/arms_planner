@@ -2,9 +2,9 @@
 #define VACUUM_GRASP_GENERATOR_HPP
 
 #include "assembler/CollisionAdapter.hpp"
-#include "assembler/MeshAsset.hpp"
 #include "assembler/MeshFunctions.hpp"
 
+#include <TopoDS_Shape.hxx>
 #include <memory>
 #include <optional>
 #include <string>
@@ -23,21 +23,21 @@ public:
     // Find the best top-down vacuum grasp for `part` that is clear of both
     // the part body and every object listed in `assembled_ids`.
     //
-    // `adapter`      — collision backend (part must already be present in it)
-    // `nozzle_mesh`  — tessellated nozzle mesh (local frame, m)
-    // `assembled_ids`— scene IDs of the other assembled parts to avoid
-    // `debug_out`    — if non-null, every attempted position + rejection reason
-    //                  is appended (world frame, mm)
+    // `adapter`       — collision backend (part must already be present in it)
+    // `nozzle_shape`  — nozzle geometry in local-frame metres (bbox centroid at origin)
+    // `assembled_ids` — scene IDs of the other assembled parts to avoid
+    // `debug_out`     — if non-null, every attempted position + rejection reason
+    //                   is appended (world frame, mm)
     //
     // Returns the grasp position in local frame (relative to shape centroid, mm)
     // — i.e. the nozzle contact point offset from the centroid — or nullopt if no
     // valid grasp exists.
     static std::optional<gp_Pnt> generate(
-        std::shared_ptr<Part>              part,
-        CollisionAdapter&                  adapter,
-        const std::shared_ptr<MeshAsset>&  nozzle_mesh,
-        const std::vector<std::string>&    assembled_ids,
-        std::vector<GraspAttempt>*         debug_out = nullptr);
+        std::shared_ptr<Part>                part,
+        CollisionAdapter&                    adapter,
+        const std::shared_ptr<TopoDS_Shape>& nozzle_shape,
+        const std::vector<std::string>&      assembled_ids,
+        std::vector<GraspAttempt>*           debug_out = nullptr);
 };
 
 #endif

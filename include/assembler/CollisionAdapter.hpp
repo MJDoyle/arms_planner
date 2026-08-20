@@ -2,6 +2,8 @@
 
 #include "assembler/SceneModel.hpp"
 
+#include <TopoDS_Shape.hxx>
+#include <memory>
 #include <string>
 
 // Abstract collision backend.  No coal/fcl types appear here or in callers.
@@ -15,9 +17,11 @@ public:
     virtual void sync(const SceneModel& scene) = 0;
 
     // Add or update a single collision object without a full re-sync.
-    // Used for temporary objects (gripper, jig) during edge feasibility checks.
+    // shape must be in local-frame metres (bbox centroid at origin), matching
+    // the convention of SceneObject::shape and Tessellator::tessellate output.
+    // Used for temporary objects (nozzle, jig) during edge feasibility checks.
     virtual void add_or_update(const std::string& id,
-                                std::shared_ptr<MeshAsset> mesh,
+                                std::shared_ptr<TopoDS_Shape> shape,
                                 const gp_Trsf& pose) = 0;
 
     // Remove a single collision object.

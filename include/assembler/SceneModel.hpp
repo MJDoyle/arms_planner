@@ -3,6 +3,7 @@
 #include "assembler/MeshAsset.hpp"
 
 #include <gp_Trsf.hxx>
+#include <TopoDS_Shape.hxx>
 
 #include <map>
 #include <memory>
@@ -12,21 +13,25 @@
 enum class SceneRole { Part, Gripper, Jig, Fixture };
 
 struct SceneObject {
-    std::shared_ptr<MeshAsset> mesh;
+    std::shared_ptr<MeshAsset>    mesh;
+    // Local-frame shape in metres (bbox centroid at origin), used for collision.
+    // Same coordinate convention as MeshAsset vertices produced by Tessellator.
+    std::shared_ptr<TopoDS_Shape> shape;
     SceneRole role{SceneRole::Part};
     // Pose: translation in metres, rotation dimensionless.  Applied to the
-    // local-frame mesh (bbox centroid at origin) to yield world coordinates.
+    // local-frame shape/mesh (bbox centroid at origin) to yield world coordinates.
     gp_Trsf pose;
     bool present{true};
 };
 
 // Neutral scene model.  The authoritative scene state: a collection of named
 // objects each with geometry, a semantic role, a world pose, and a present/absent
-// flag.  No collision-library types appear here; the CoalAdapter is a consumer.
+// flag.  No collision-library types appear here; the OcctCollisionAdapter is a consumer.
 class SceneModel {
 public:
     void add_object(const std::string& id,
-                    std::shared_ptr<MeshAsset> mesh,
+                    std::shared_ptr<MeshAsset>    mesh,
+                    std::shared_ptr<TopoDS_Shape> shape,
                     SceneRole role,
                     const gp_Trsf& pose,
                     bool present = true);
@@ -46,7 +51,7 @@ public:
     // IDs of all currently present objects.
     std::vector<std::string> present_object_ids() const;
 
-    // Read-only access to the full map (used by CoalAdapter::sync).
+    // Read-only access to the full map (used by OcctCollisionAdapter::sync).
     const std::map<std::string, SceneObject>& objects() const { return objects_; }
 
     void clear() { objects_.clear(); }

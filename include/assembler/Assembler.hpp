@@ -43,7 +43,8 @@ public:
     std::shared_ptr<Assembly> getTargetAssembly() { return target_assembly_; }
     std::vector<std::shared_ptr<AssemblyNode>> getAssemblyPath() { return assembly_path_; }
     std::string getName() { return name_; }
-    std::shared_ptr<MeshAsset> getNozzleMesh() const { return nozzle_mesh_; }
+    std::shared_ptr<MeshAsset>    getNozzleMesh()  const { return nozzle_mesh_;  }
+    std::shared_ptr<TopoDS_Shape> getNozzleShape() const { return nozzle_shape_; }
 
     void setName(std::string name) { name_ = name; }
 
@@ -129,12 +130,15 @@ private:
 
     std::vector<std::shared_ptr<AssemblyNode>> findNodeNeighbours(std::shared_ptr<AssemblyNode> node);
 
-    // Neutral scene model and Coal backend.  Built in generateInitialAssembly.
+    // Neutral scene model and OCCT collision backend.  Built in generateInitialAssembly.
     SceneModel scene_;
     std::unique_ptr<CollisionAdapter> collision_adapter_;
 
-    // Tessellated vacuum nozzle mesh (shared across all edge checks).
-    std::shared_ptr<MeshAsset> nozzle_mesh_;
+    // Vacuum nozzle geometry used across all edge checks.
+    // nozzle_mesh_ — tessellated for visualisation; nozzle_shape_ — B-rep for collision.
+    // Both are in local-frame metres with the bbox centroid at the origin.
+    std::shared_ptr<MeshAsset>    nozzle_mesh_;
+    std::shared_ptr<TopoDS_Shape> nozzle_shape_;
 
     std::shared_ptr<Assembly> initial_assembly_;
 
