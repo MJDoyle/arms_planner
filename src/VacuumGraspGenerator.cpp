@@ -6,7 +6,8 @@
 #include <limits>
 
 // ---------------------------------------------------------------------------
-// Vacuum grasp search using Coal BVH for all collision checks.
+// Vacuum grasp search using OCCT BRepExtrema_DistShapeShape for all collision
+// checks (via OcctCollisionAdapter).
 //
 // Algorithm:
 //   For each planar, upward-facing face with sufficient area:
@@ -18,7 +19,7 @@
 //       (b) nozzle is collision-free with every assembled-part ID
 //   Among all accepted candidates, return the one closest to the CoM.
 //
-// Nozzle geometry (matches VacuumGraspGenerator legacy dimensions):
+// Nozzle geometry:
 //   radius 4.2 mm, height 20 mm, local-frame centroid at origin,
 //   bottom at z = -10 mm, top at z = +10 mm.
 //
@@ -29,13 +30,13 @@
 // ---------------------------------------------------------------------------
 
 std::optional<gp_Pnt> VacuumGraspGenerator::generate(
-    std::shared_ptr<Part>              part,
-    CollisionAdapter&                  adapter,
-    const std::shared_ptr<MeshAsset>&  nozzle_mesh,
-    const std::vector<std::string>&    assembled_ids,
-    std::vector<GraspAttempt>*         debug_out)
+    std::shared_ptr<Part>                part,
+    CollisionAdapter&                    adapter,
+    const std::shared_ptr<TopoDS_Shape>& nozzle_shape,
+    const std::vector<std::string>&      assembled_ids,
+    std::vector<GraspAttempt>*           debug_out)
 {
-    if (!nozzle_mesh)
+    if (!nozzle_shape)
         return std::nullopt;
 
     TopoDS_Shape shape = *(part->getShape());
@@ -59,6 +60,9 @@ std::optional<gp_Pnt> VacuumGraspGenerator::generate(
     struct Candidate {
         double   com_dist;
         gp_Pnt   local_pos;  // grasp in local frame (contact point, mm)
+        // Index of this candidate's entry in *debug_out, so the winner can be
+        // flagged once all faces have been searched.  Unused when debug_out is null.
+        size_t   debug_index;
     };
     std::vector<Candidate> candidates;
 
@@ -91,7 +95,7 @@ std::optional<gp_Pnt> VacuumGraspGenerator::generate(
                 // Pose in metres (Tessellator stores local-frame mesh with centroid at origin).
                 gp_Trsf pose;
                 pose.SetTranslation(gp_Vec(nx * 0.001, ny * 0.001, nozzle_cen_z_mm * 0.001));
-                adapter.add_or_update("__grasp_nozzle__", nozzle_mesh, pose);
+                adapter.add_or_update("__grasp_nozzle__", nozzle_shape, pose);
 
                 // (a) Nozzle body must not intersect the part.
                 bool body_clear = adapter.collision_free("__grasp_nozzle__", part_id);
@@ -114,13 +118,13 @@ std::optional<gp_Pnt> VacuumGraspGenerator::generate(
 
                 if (!body_clear) {
                     if (debug_out)
-                        debug_out->push_back({nx, ny, nozzle_cen_z_mm,
+                        debug_out->push_back({part->getId(), nx, ny, nozzle_cen_z_mm,
                                               GraspAttempt::Status::body_collision});
                     continue;
                 }
                 if (!assembly_clear) {
                     if (debug_out)
-                        debug_out->push_back({nx, ny, nozzle_cen_z_mm,
+                        debug_out->push_back({part->getId(), nx, ny, nozzle_cen_z_mm,
                                               GraspAttempt::Status::assembly_collision});
                     continue;
                 }
@@ -136,15 +140,18 @@ std::optional<gp_Pnt> VacuumGraspGenerator::generate(
                     TopoDS_Shape isect = ShapeIntersection(tip, shape);
                     if (isect.IsNull() || ShapeVolume(isect) / tip_vol < TIP_SEAL_FRAC) {
                         if (debug_out)
-                            debug_out->push_back({nx, ny, nozzle_cen_z_mm,
+                            debug_out->push_back({part->getId(), nx, ny, nozzle_cen_z_mm,
                                                   GraspAttempt::Status::seal_failed});
                         continue;
                     }
                 }
 
-                if (debug_out)
-                    debug_out->push_back({nx, ny, nozzle_cen_z_mm,
+                size_t debug_index = 0;
+                if (debug_out) {
+                    debug_index = debug_out->size();
+                    debug_out->push_back({part->getId(), nx, ny, nozzle_cen_z_mm,
                                           GraspAttempt::Status::accepted});
+                }
 
                 // Grasp = contact point in local frame (bottom of nozzle = face surface).
                 const gp_Pnt local_pos(
@@ -153,7 +160,7 @@ std::optional<gp_Pnt> VacuumGraspGenerator::generate(
                     face_top_z  - shape_centroid.Z());
 
                 const double com_dist = std::hypot(nx - shape_com.X(), ny - shape_com.Y());
-                candidates.push_back({com_dist, local_pos});
+                candidates.push_back({com_dist, local_pos, debug_index});
                 found_on_face = true;
             }
         }
@@ -170,11 +177,229 @@ std::optional<gp_Pnt> VacuumGraspGenerator::generate(
         candidates.begin(), candidates.end(),
         [](const Candidate& a, const Candidate& b){ return a.com_dist < b.com_dist; });
 
+    // Flag the attempt that won, so the viewer can distinguish the grasp that
+    // will actually be used from the other viable candidates.
+    if (debug_out)
+        (*debug_out)[best->debug_index].chosen = true;
+
     RCLCPP_INFO(logger(),
                 "VacuumGraspGenerator: grasp for %s  pos=(%.2f, %.2f, %.2f)  CoM dist=%.2f",
                 part->getName().c_str(),
                 best->local_pos.X(), best->local_pos.Y(), best->local_pos.Z(),
                 best->com_dist);
+
+    return best->local_pos;
+}
+
+// ---------------------------------------------------------------------------
+// precompute() / select() — split version of generate() used on the DFS hot
+// path.  precompute() does the part-geometry-only work (candidate placement,
+// body-collision, seal check) once per part; select() re-runs only the cheap
+// assembled-parts collision check against that cached candidate list, for
+// each DFS node that reconsiders the part.  Together they are exactly
+// equivalent to calling generate() fresh every time — see the per-point
+// comments below for why.
+// ---------------------------------------------------------------------------
+
+PartGraspCandidates VacuumGraspGenerator::precompute(
+    std::shared_ptr<Part>                part,
+    const gp_Pnt&                        world_pos_mm,
+    const std::shared_ptr<TopoDS_Shape>& local_frame_shape,
+    CollisionAdapter&                    adapter,
+    const std::shared_ptr<TopoDS_Shape>& nozzle_shape)
+{
+    PartGraspCandidates result;
+    if (!nozzle_shape) return result;
+
+    TopoDS_Shape shape = *(part->getShape());
+
+    constexpr double NOZZLE_RADIUS  =  4.2;
+    constexpr double NOZZLE_H_HALF  = 10.0;
+    constexpr double NOZZLE_GAP_MM  =  1.0;
+    constexpr double FACE_MIN_AREA  = 50.0;
+    constexpr double ANGLE_TOL      = 0.05;
+    constexpr double TIP_HEIGHT     =  1.0;
+    constexpr double TIP_SEAL_FRAC  =  0.95;
+    const double     tip_vol = M_PI * NOZZLE_RADIUS * NOZZLE_RADIUS * TIP_HEIGHT;
+
+    const gp_Pnt shape_com      = ShapeCenterOfMass(shape);
+    const gp_Pnt shape_centroid = ShapeCentroid(shape);
+
+    const std::string part_id = part->getName() + "_" + std::to_string(part->getId());
+
+    // Register this part in the (private, per-call) adapter — it must be
+    // present for the body-collision check below.  Same local-frame +
+    // world-pose convention as Assembler's scene population, so this is
+    // geometrically identical to the copy held in the shared collision
+    // adapter used later at select() time.  local_frame_shape is passed in
+    // (already built and tessellated by the caller) rather than built here —
+    // see the header comment on why building/meshing it per-call would race.
+    {
+        gp_Trsf pose;
+        pose.SetTranslation(gp_Vec(world_pos_mm.X() * 0.001,
+                                    world_pos_mm.Y() * 0.001,
+                                    world_pos_mm.Z() * 0.001));
+        adapter.add_or_update(part_id, local_frame_shape, pose);
+    }
+
+    for (TopExp_Explorer exp(shape, TopAbs_FACE); exp.More(); exp.Next())
+    {
+        const TopoDS_Face face = TopoDS::Face(exp.Current());
+
+        if (!BRep_Tool::Surface(face)->IsKind(STANDARD_TYPE(Geom_Plane))) continue;
+        const gp_Dir normal = outwardFaceNormal(face);
+        if (normal.Angle(UPWARDS) > ANGLE_TOL) continue;
+        if (faceArea(face) < FACE_MIN_AREA)    continue;
+
+        const gp_Pnt  face_cen     = ShapeCentroid(face);
+        const double  face_top_z   = ShapeHighestPoint(face);
+        const double  largest_axis = std::max(ShapeAxisSize(face, 0), ShapeAxisSize(face, 1));
+        const double  nozzle_cen_z_mm = face_top_z + NOZZLE_GAP_MM + NOZZLE_H_HALF;
+
+        std::vector<GraspCandidate> face_candidates;
+
+        // Unlike generate(), this does NOT stop at the first candidate: the
+        // assembly-collision check is deferred to select(), so at this point
+        // we don't yet know which of these will actually be usable — every
+        // point that's locally valid (clears the body + seals) has to be
+        // kept so select() can walk them in the same order generate() would
+        // have.
+        for (double r = 0.0; r < largest_axis; r += 0.5)
+        {
+            for (int th = 0; th < 360; th += 45)
+            {
+                const double nx = face_cen.X() + r * std::cos(th * M_PI / 180.0);
+                const double ny = face_cen.Y() + r * std::sin(th * M_PI / 180.0);
+
+                gp_Trsf pose;
+                pose.SetTranslation(gp_Vec(nx * 0.001, ny * 0.001, nozzle_cen_z_mm * 0.001));
+                adapter.add_or_update("__grasp_nozzle__", nozzle_shape, pose);
+                bool body_clear = adapter.collision_free("__grasp_nozzle__", part_id);
+                adapter.remove("__grasp_nozzle__");
+
+                if (!body_clear) {
+                    result.rejected.push_back({nx, ny, nozzle_cen_z_mm,
+                                               GraspAttempt::Status::body_collision});
+                    continue;
+                }
+
+                TopoDS_Shape tip = BRepPrimAPI_MakeCylinder(NOZZLE_RADIUS, TIP_HEIGHT).Shape();
+                tip = ShapeSetCentroid(tip, gp_Pnt(nx, ny, face_top_z - TIP_HEIGHT * 0.5));
+                TopoDS_Shape isect = ShapeIntersection(tip, shape);
+                if (isect.IsNull() || ShapeVolume(isect) / tip_vol < TIP_SEAL_FRAC) {
+                    result.rejected.push_back({nx, ny, nozzle_cen_z_mm,
+                                               GraspAttempt::Status::seal_failed});
+                    continue;
+                }
+
+                const gp_Pnt local_pos(
+                    nx          - shape_centroid.X(),
+                    ny          - shape_centroid.Y(),
+                    face_top_z  - shape_centroid.Z());
+                const double com_dist = std::hypot(nx - shape_com.X(), ny - shape_com.Y());
+
+                face_candidates.push_back({nx, ny, nozzle_cen_z_mm, local_pos, com_dist});
+            }
+        }
+
+        if (!face_candidates.empty())
+            result.faces.push_back(std::move(face_candidates));
+    }
+
+    return result;
+}
+
+std::optional<gp_Pnt> VacuumGraspGenerator::select(
+    std::shared_ptr<Part>                part,
+    const PartGraspCandidates&           candidates,
+    CollisionAdapter&                    adapter,
+    const std::shared_ptr<TopoDS_Shape>& nozzle_shape,
+    const std::vector<std::string>&      assembled_ids,
+    std::vector<GraspAttempt>*           debug_out)
+{
+    std::optional<GraspCandidate> best;
+    size_t best_debug_index = 0;
+
+    // Replay the geometry-only rejections precompute() already found, so the
+    // record covers every position tried, not just those reaching this stage.
+    if (debug_out)
+        for (const auto& r : candidates.rejected)
+            debug_out->push_back({part->getId(), r.world_x_mm, r.world_y_mm,
+                                  r.nozzle_cen_z_mm, r.reason});
+
+    for (const auto& face_candidates : candidates.faces)
+    {
+        // First candidate on this face that's also clear of every assembled
+        // part — same "first in spiral order" semantics as generate(),
+        // since face_candidates is already filtered to body-clear + sealed
+        // points in that order.
+        //
+        // When recording, the loop keeps going past that first hit so the rest
+        // of the viable placements can be reported as alternatives.  The winner
+        // is still fixed by the first hit, so recording never changes the result.
+        bool face_settled = false;
+
+        for (const auto& c : face_candidates)
+        {
+            gp_Trsf pose;
+            pose.SetTranslation(gp_Vec(c.world_x_mm * 0.001, c.world_y_mm * 0.001,
+                                        c.nozzle_cen_z_mm * 0.001));
+            adapter.add_or_update("__grasp_nozzle__", nozzle_shape, pose);
+
+            bool assembly_clear = true;
+            for (const auto& aid : assembled_ids)
+            {
+                if (!adapter.collision_free("__grasp_nozzle__", aid))
+                {
+                    assembly_clear = false;
+                    break;
+                }
+            }
+            adapter.remove("__grasp_nozzle__");
+
+            if (!assembly_clear)
+            {
+                if (debug_out)
+                    debug_out->push_back({part->getId(), c.world_x_mm, c.world_y_mm,
+                                          c.nozzle_cen_z_mm,
+                                          GraspAttempt::Status::assembly_collision});
+                continue;
+            }
+
+            if (debug_out)
+                debug_out->push_back({part->getId(), c.world_x_mm, c.world_y_mm,
+                                      c.nozzle_cen_z_mm,
+                                      GraspAttempt::Status::accepted});
+
+            if (!face_settled)
+            {
+                face_settled = true;
+                if (!best || c.com_dist_mm < best->com_dist_mm)
+                {
+                    best = c;
+                    if (debug_out) best_debug_index = debug_out->size() - 1;
+                }
+                if (!debug_out) break;   // fast path: nothing more to learn
+            }
+        }
+    }
+
+    // Flag the winner among the accepted candidates.
+    if (debug_out && best)
+        (*debug_out)[best_debug_index].chosen = true;
+
+    if (!best)
+    {
+        RCLCPP_WARN(logger(), "VacuumGraspGenerator: no valid grasp for %s",
+                    part->getName().c_str());
+        return std::nullopt;
+    }
+
+    RCLCPP_INFO(logger(),
+                "VacuumGraspGenerator: grasp for %s  pos=(%.2f, %.2f, %.2f)  CoM dist=%.2f",
+                part->getName().c_str(),
+                best->local_pos.X(), best->local_pos.Y(), best->local_pos.Z(),
+                best->com_dist_mm);
 
     return best->local_pos;
 }

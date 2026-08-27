@@ -209,4 +209,11 @@ double faceArea(const TopoDS_Face& face);
 
 TopoDS_Shape makeCompound(const std::vector<TopoDS_Shape>& shapes);
 
+// Convert a shape from its native mm coordinate frame to local-frame metres:
+// result(p) = 0.001 * (p_mm - bbox_centroid_mm).
+// This matches the vertex convention used by Tessellator::tessellate, so the
+// returned shape is compatible with the poses stored in SceneObject::pose and
+// used by OcctCollisionAdapter.
+TopoDS_Shape LocalFrameShapeM(const TopoDS_Shape& shape_mm);
+
 #endif

@@ -13,6 +13,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <functional>
 
 
 class aiScene;
@@ -43,7 +44,8 @@ public:
     std::shared_ptr<Assembly> getTargetAssembly() { return target_assembly_; }
     std::vector<std::shared_ptr<AssemblyNode>> getAssemblyPath() { return assembly_path_; }
     std::string getName() { return name_; }
-    std::shared_ptr<MeshAsset> getNozzleMesh() const { return nozzle_mesh_; }
+    std::shared_ptr<MeshAsset>    getNozzleMesh()  const { return nozzle_mesh_;  }
+    std::shared_ptr<TopoDS_Shape> getNozzleShape() const { return nozzle_shape_; }
 
     void setName(std::string name) { name_ = name; }
 
@@ -112,6 +114,22 @@ private:
     // Pre-assign bay indices and positions for all external parts before DFS.
     void assignExternalBayPositions();
 
+    // Compute geometry-only grasp candidates (VacuumGraspGenerator::precompute)
+    // for every external part once, in parallel, before the DFS starts.
+    // edge_feasible() then only re-runs the cheap assembled-parts check
+    // against these cached candidates instead of the full search.
+    void precomputeGraspCandidates();
+
+    // The (part, assembled-part-IDs) pairs at which each external part should be
+    // grasp-checked.  See Assembler.cpp for why the assembly path matters here.
+    std::vector<std::pair<std::shared_ptr<Part>, std::vector<std::string>>>
+    graspEvaluationContexts() const;
+
+    // Re-point the collision scene at the target assembly's current transforms.
+    // Must be called before any collision query that runs after
+    // alignAssemblyPathToInitialAssembly() has moved the assembly.
+    void refreshCollisionScene();
+
     // Check whether removing `part` from `assembled` is physically feasible.
     // Returns nullopt if infeasible; otherwise the grasp position in local frame
     // (relative to part centroid, mm) — zero for parts without a grasp (internal).
@@ -129,12 +147,30 @@ private:
 
     std::vector<std::shared_ptr<AssemblyNode>> findNodeNeighbours(std::shared_ptr<AssemblyNode> node);
 
-    // Neutral scene model and Coal backend.  Built in generateInitialAssembly.
+    // Neutral scene model and collision backend.  Built in generateInitialAssembly.
     SceneModel scene_;
     std::unique_ptr<CollisionAdapter> collision_adapter_;
 
-    // Tessellated vacuum nozzle mesh (shared across all edge checks).
-    std::shared_ptr<MeshAsset> nozzle_mesh_;
+    // Constructs a fresh CollisionAdapter of whatever concrete type
+    // collision_adapter_ is — used by precomputeGraspCandidates() to give
+    // each worker thread its own private, unshared adapter instance.
+    std::function<std::unique_ptr<CollisionAdapter>()> make_collision_adapter_;
+
+    // Geometry-only grasp candidates per external part (by Part ID), built
+    // once by precomputeGraspCandidates() before the DFS starts.
+    std::map<size_t, PartGraspCandidates> grasp_candidates_;
+
+    // Every grasp attempt behind the selected grasps, recorded by the single
+    // authoritative pass in generateGrasps().  debugGrasps() just hands this to
+    // the visualiser — nothing re-runs the search, so what is drawn always
+    // describes the grasp the machine will use.
+    std::vector<GraspAttempt> grasp_attempts_;
+
+    // Vacuum nozzle geometry used across all edge checks.
+    // nozzle_mesh_ — tessellated for visualisation; nozzle_shape_ — B-rep for collision.
+    // Both are in local-frame metres with the bbox centroid at the origin.
+    std::shared_ptr<MeshAsset>    nozzle_mesh_;
+    std::shared_ptr<TopoDS_Shape> nozzle_shape_;
 
     std::shared_ptr<Assembly> initial_assembly_;
 

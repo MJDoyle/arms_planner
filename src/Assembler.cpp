@@ -30,6 +30,12 @@
 #include <filesystem>
 #include <limits>
 
+#include <atomic>
+#include <mutex>
+#include <thread>
+
+#include <BRepMesh_IncrementalMesh.hxx>
+
 #include "assembler/Part.hpp"
 
 #include "assembler/Logger.hpp"
@@ -65,6 +71,7 @@ void Assembler::reset()
     scene_.clear();
     collision_adapter_.reset();
     nozzle_mesh_.reset();
+    nozzle_shape_.reset();
 
     initialisePartBays();
 }
@@ -556,6 +563,16 @@ void Assembler::alignAssemblyPathToInitialAssembly()
         }
     }
 
+    // Recorded grasp attempts are world-frame positions captured before this
+    // translation, so they must move with the assembly — otherwise the viewer
+    // draws them at the pre-alignment location while the parts sit on the bed.
+    for (auto& a : grasp_attempts_)
+    {
+        a.x_mm += delta.X();
+        a.y_mm += delta.Y();
+        a.z_mm += delta.Z();
+    }
+
     // Sync target_assembly_ with the translated positions from the last path node.
     // When loading from cache, assembly_path_.back() is a fresh Assembly (not target_assembly_),
     // so target_assembly_ must be updated explicitly. When the DFS generated the path,
@@ -646,11 +663,19 @@ bool Assembler::arrangeInternalParts()
 {
     RCLCPP_INFO(logger(), "Arranging initial internal parts on bed");
 
-    double currentY = PRINT_BED_BOTTOM_LEFT[1];
+    // Inset by PRINT_MIN_SPACING so the first part in each row isn't flush with
+    // the bed edge — the slicer's skirt/brim extends a few mm beyond the part
+    // and would otherwise be generated off the bed.
+    const double bed_min_x = PRINT_BED_BOTTOM_LEFT[0] + PRINT_MIN_SPACING;
+    const double bed_max_x = PRINT_BED_TOP_RIGHT[0]   - PRINT_MIN_SPACING;
+    const double bed_min_y = PRINT_BED_BOTTOM_LEFT[1] + PRINT_MIN_SPACING;
+    const double bed_max_y = PRINT_BED_TOP_RIGHT[1]   - PRINT_MIN_SPACING;
 
-    double currentX = PRINT_BED_TOP_RIGHT[0];
+    double currentY = bed_min_y;
 
-    double nextY = PRINT_BED_BOTTOM_LEFT[1];
+    double currentX = bed_max_x;
+
+    double nextY = bed_min_y;
 
     for (auto const& [part, transform] : initial_assembly_->getUnassembledPartTransforms())    //All parts unassembled in initial assembly
     {
@@ -668,17 +693,17 @@ bool Assembler::arrangeInternalParts()
             double topY = currentY + ShapeAxisSize(shape, 1) + PRINT_MIN_SPACING;
 
             //Check the new position is within parts bay bounds
-            if (topY > PRINT_BED_TOP_RIGHT[1])
+            if (topY > bed_max_y)
             {
                 //Parts can't fit, return false
                 return false;
             }
 
-            else if (nextX < PRINT_BED_BOTTOM_LEFT[0])
+            else if (nextX < bed_min_x)
             {
                 //Start a new y layer, try again with this part
                 currentY = nextY;
-                currentX = PRINT_BED_TOP_RIGHT[0];
+                currentX = bed_max_x;
 
                 continue;
             }
@@ -1011,13 +1036,16 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
     const std::string part_id = part->getName() + "_" + std::to_string(part->getId());
     const gp_Pnt assembly_centroid = assembled.at(part);  // mm
 
-    // ---- Coal z-step lift (all parts) ----
+    // ---- z-step lift collision check (all parts) ----
     // Skipped entirely when the user has set a non-zero collision volume threshold,
     // which signals deliberately generous collision handling.
     if (collision_volume_threshold_ == 0.0)
     {
         const double STEP_MM = 1.0;
         const int    N_STEPS = 5;
+
+        auto part_lf_shape = std::make_shared<TopoDS_Shape>(
+            LocalFrameShapeM(*part->getShape()));
 
         bool z_ok = true;
         for (int step = 1; step <= N_STEPS && z_ok; ++step)
@@ -1027,12 +1055,12 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
                 assembly_centroid.X() * 0.001,
                 assembly_centroid.Y() * 0.001,
                 (assembly_centroid.Z() + step * STEP_MM) * 0.001));
-            collision_adapter_->add_or_update(part_id, part->get_mesh_asset(), lifted);
+            collision_adapter_->add_or_update(part_id, part_lf_shape, lifted);
 
             for (auto const& [other, _] : assembled)
             {
                 if (other->getId() == part->getId()) continue;
-                if (!other->get_mesh_asset()) continue;
+                if (!other->getShape()) continue;
                 const std::string other_id = other->getName() + "_" + std::to_string(other->getId());
                 if (!collision_adapter_->collision_free(part_id, other_id))
                 {
@@ -1049,7 +1077,7 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
                 assembly_centroid.X() * 0.001,
                 assembly_centroid.Y() * 0.001,
                 assembly_centroid.Z() * 0.001));
-            collision_adapter_->add_or_update(part_id, part->get_mesh_asset(), original);
+            collision_adapter_->add_or_update(part_id, part_lf_shape, original);
         }
 
         if (!z_ok) return std::nullopt;
@@ -1058,10 +1086,12 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
     // Non-external parts: z-step is sufficient.
     if (part->getType() != Part::EXTERNAL) return gp_Pnt(0, 0, 0);
     if (!generate_grasps_)                 return gp_Pnt(0, 0, 0);
-    if (!nozzle_mesh_)                     return gp_Pnt(0, 0, 0);
+    if (!nozzle_shape_)                    return gp_Pnt(0, 0, 0);
 
     // ---- Grasp search (external parts) ----
-    // VacuumGraspGenerator checks nozzle vs part body AND vs assembled parts.
+    // Body-collision + seal checks were already done once for this part in
+    // precomputeGraspCandidates(); only the (cheap) check against the parts
+    // currently assembled at this DFS node needs to run here.
     std::vector<std::string> assembled_ids;
     assembled_ids.reserve(assembled.size());
     for (auto const& [other, _] : assembled)
@@ -1070,8 +1100,11 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
         assembled_ids.push_back(other->getName() + "_" + std::to_string(other->getId()));
     }
 
-    auto grasp_opt = VacuumGraspGenerator::generate(
-        part, *collision_adapter_, nozzle_mesh_, assembled_ids);
+    auto candidates_it = grasp_candidates_.find(part->getId());
+    if (candidates_it == grasp_candidates_.end()) return std::nullopt;
+
+    auto grasp_opt = VacuumGraspGenerator::select(
+        part, candidates_it->second, *collision_adapter_, nozzle_shape_, assembled_ids);
 
     if (!grasp_opt) return std::nullopt;
     const gp_Pnt grasp = *grasp_opt;
@@ -1188,13 +1221,15 @@ void Assembler::generateInitialAssembly()
     // Pre-assign bay positions for external parts so they are available during DFS.
     assignExternalBayPositions();
 
-    // Move shapes to their assembly positions — Coal poses and OCCT face queries
-    // inside VacuumGraspGenerator must be consistent during DFS.
+    // Move shapes to their assembly positions — OCCT face queries inside
+    // VacuumGraspGenerator must be consistent during DFS.
     target_assembly_->setPartTransforms();
 
-    // Tessellate the vacuum nozzle once for use in edge_feasible and generate().
+    // Load the vacuum nozzle once for use in edge_feasible and generate().
     // Try to load from the user-supplied STEP file first; fall back to a
     // 4.2 mm radius × 20 mm cylinder if the file is absent or unreadable.
+    // raw_nozzle keeps the mm-space shape before local-frame conversion.
+    TopoDS_Shape raw_nozzle;
     if (!tool_config_.mesh_file.empty()) {
         STEPControl_Reader reader;
         if (reader.ReadFile(tool_config_.mesh_file.c_str()) == IFSelect_RetDone) {
@@ -1202,6 +1237,7 @@ void Assembler::generateInitialAssembly()
             TopoDS_Shape shape = reader.OneShape();
             if (!shape.IsNull()) {
                 nozzle_mesh_ = Tessellator::tessellate(shape, MESH_DEFLECTION_MM);
+                raw_nozzle   = shape;
                 RCLCPP_INFO(logger(), "Nozzle mesh loaded from '%s': %zu verts, %zu tris",
                             tool_config_.mesh_file.c_str(),
                             nozzle_mesh_->vertices.size(),
@@ -1214,16 +1250,19 @@ void Assembler::generateInitialAssembly()
     }
     if (!nozzle_mesh_) {
         // Fallback: radius 4.2 mm, height 20 mm, bottom at z=0, centroid at z=10.
-        TopoDS_Shape nozzle_shape =
-            BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(0,0,0), gp_Dir(0,0,1)), 4.2, 20.0).Shape();
-        nozzle_mesh_ = Tessellator::tessellate(nozzle_shape, MESH_DEFLECTION_MM);
+        raw_nozzle  = BRepPrimAPI_MakeCylinder(
+            gp_Ax2(gp_Pnt(0,0,0), gp_Dir(0,0,1)), 4.2, 20.0).Shape();
+        nozzle_mesh_ = Tessellator::tessellate(raw_nozzle, MESH_DEFLECTION_MM);
     }
 
-    // Align the nozzle mesh so its contact face (min-z vertex) sits at exactly
-    // z = -0.01 m in local frame.  VacuumGraspGenerator and edge_feasible both
-    // place the nozzle origin at face_z + GAP + NOZZLE_H_HALF and expect the
-    // mesh bottom to be 0.01 m below that origin.  The cylinder satisfies this
-    // by construction; loaded STEP geometry may not.
+    // Convert nozzle to local-frame metres for collision (same convention as
+    // Tessellator: bbox centroid at origin, mm → m).
+    nozzle_shape_ = std::make_shared<TopoDS_Shape>(LocalFrameShapeM(raw_nozzle));
+
+    // Align the nozzle so its contact face (min-z) sits at exactly z = -0.01 m.
+    // VacuumGraspGenerator places the nozzle origin at face_z + GAP + NOZZLE_H_HALF
+    // and expects the bottom to be 0.01 m below that origin.  The cylinder satisfies
+    // this by construction; loaded STEP geometry may not.
     {
         double min_z = std::numeric_limits<double>::max();
         for (const auto& v : nozzle_mesh_->vertices)
@@ -1233,14 +1272,16 @@ void Assembler::generateInitialAssembly()
         if (std::abs(shift) > 1e-6) {
             for (auto& v : nozzle_mesh_->vertices)
                 v[2] += shift;
-            RCLCPP_INFO(logger(), "Nozzle mesh z-shifted %.2f mm to align contact face",
+            gp_Trsf z_adj;
+            z_adj.SetTranslation(gp_Vec(0.0, 0.0, shift));
+            *nozzle_shape_ = BRepBuilderAPI_Transform(*nozzle_shape_, z_adj, true).Shape();
+            RCLCPP_INFO(logger(), "Nozzle z-shifted %.2f mm to align contact face",
                         shift * 1000.0);
         }
     }
 
     // Apply the per-tool XYZ correction from the tool config (mm → m).
-    // This corrects any lateral offset visible when the mesh is displayed in
-    // the visualisation relative to the part geometry.
+    // This corrects any lateral offset visible in the visualisation.
     {
         const double dx = tool_config_.offset_x_mm * 0.001;
         const double dy = tool_config_.offset_y_mm * 0.001;
@@ -1251,7 +1292,10 @@ void Assembler::generateInitialAssembly()
                 v[1] += dy;
                 v[2] += dz;
             }
-            RCLCPP_INFO(logger(), "Nozzle mesh offset applied: (%.2f, %.2f, %.2f) mm",
+            gp_Trsf xyz_adj;
+            xyz_adj.SetTranslation(gp_Vec(dx, dy, dz));
+            *nozzle_shape_ = BRepBuilderAPI_Transform(*nozzle_shape_, xyz_adj, true).Shape();
+            RCLCPP_INFO(logger(), "Nozzle offset applied: (%.2f, %.2f, %.2f) mm",
                         tool_config_.offset_x_mm,
                         tool_config_.offset_y_mm,
                         tool_config_.offset_z_mm);
@@ -1263,7 +1307,7 @@ void Assembler::generateInitialAssembly()
     scene_.clear();
     for (auto const& [part, transform] : target_assembly_->getAssembledPartTransforms())
     {
-        if (!part->get_mesh_asset()) continue;
+        if (!part->getShape()) continue;
 
         gp_Trsf pose;
         pose.SetTranslation(gp_Vec(transform.X() * 0.001,
@@ -1271,16 +1315,113 @@ void Assembler::generateInitialAssembly()
                                    transform.Z() * 0.001));
 
         const std::string id = part->getName() + "_" + std::to_string(part->getId());
-        scene_.add_object(id, part->get_mesh_asset(), SceneRole::Part, pose, true);
+        auto lf_shape = std::make_shared<TopoDS_Shape>(LocalFrameShapeM(*part->getShape()));
+        scene_.add_object(id, part->get_mesh_asset(), lf_shape, SceneRole::Part, pose, true);
     }
 
     const double safety_margin_m = MESH_DEFLECTION_MM * 0.5 * 0.001;
-    collision_adapter_ = std::make_unique<CoalAdapter>(safety_margin_m);
+    make_collision_adapter_ = [safety_margin_m]() {
+        return std::make_unique<CoalAdapter>(safety_margin_m);
+    };
+    collision_adapter_ = make_collision_adapter_();
     collision_adapter_->sync(scene_);
 
-    RCLCPP_INFO(logger(), "SceneModel built with %zu objects (safety margin %.4f mm)",
+    RCLCPP_INFO(logger(), "SceneModel built with %zu objects (Coal, safety margin %.4f mm)",
                 scene_.present_object_ids().size(),
                 safety_margin_m * 1000.0);
+
+    precomputeGraspCandidates();
+}
+
+// Compute geometry-only grasp candidates for every external part once, in
+// parallel — see VacuumGraspGenerator::precompute for what's cached and why
+// it's safe to defer the assembled-parts check to select() at DFS time.
+// Each worker gets its own CollisionAdapter instance (via
+// make_collision_adapter_) so no thread touches the shared collision_adapter_.
+void Assembler::precomputeGraspCandidates()
+{
+    grasp_candidates_.clear();
+    if (!generate_grasps_ || !nozzle_shape_ || !make_collision_adapter_) return;
+
+    struct Job {
+        std::shared_ptr<Part>         part;
+        gp_Pnt                        world_pos_mm;
+        std::shared_ptr<TopoDS_Shape> local_frame_shape;
+    };
+    std::vector<Job> jobs;
+    for (auto const& [part, transform] : target_assembly_->getAssembledPartTransforms())
+        if (part->getType() == Part::EXTERNAL && part->getShape())
+            jobs.push_back({part, transform, nullptr});
+
+    if (jobs.empty()) return;
+
+    // Build and tessellate every shape the worker threads below will touch
+    // — the nozzle and each part's local-frame collision copy — serially,
+    // before any thread starts.  BRepMesh_IncrementalMesh mutates the
+    // shape's internal triangulation cache; nozzle_shape_ in particular is
+    // the exact same object every worker reads, and duplicate/instanced
+    // parts (e.g. repeated screws) can share underlying OCCT geometry too,
+    // so triangulating lazily on first concurrent use would race. Once meshed
+    // here, every worker only ever reads already-built triangulation data.
+    const double deflection_m = MESH_DEFLECTION_MM * 0.001;
+    {
+        BRepMesh_IncrementalMesh nozzle_mesher(*nozzle_shape_, deflection_m);
+        nozzle_mesher.Perform();
+    }
+    for (auto& job : jobs) {
+        job.local_frame_shape = std::make_shared<TopoDS_Shape>(
+            LocalFrameShapeM(*job.part->getShape()));
+        BRepMesh_IncrementalMesh mesher(*job.local_frame_shape, deflection_m);
+        mesher.Perform();
+    }
+
+    RCLCPP_INFO(logger(), "Precomputing grasp candidates for %zu external part(s)...",
+                jobs.size());
+
+    std::mutex results_mutex;
+    std::atomic<size_t> next_index{0};
+
+    const unsigned n_threads = std::max(1u, std::min(
+        std::thread::hardware_concurrency(),
+        static_cast<unsigned>(jobs.size())));
+
+    auto worker = [&]() {
+        for (;;) {
+            const size_t i = next_index.fetch_add(1);
+            if (i >= jobs.size()) return;
+
+            const auto& job = jobs[i];
+            auto adapter = make_collision_adapter_();
+            PartGraspCandidates candidates = VacuumGraspGenerator::precompute(
+                job.part, job.world_pos_mm, job.local_frame_shape, *adapter, nozzle_shape_);
+
+            std::lock_guard<std::mutex> lock(results_mutex);
+            grasp_candidates_[job.part->getId()] = std::move(candidates);
+        }
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(n_threads);
+    for (unsigned t = 0; t < n_threads; ++t)
+        pool.emplace_back(worker);
+    for (auto& th : pool)
+        th.join();
+
+    RCLCPP_INFO(logger(), "Grasp candidate precompute done (%u threads)", n_threads);
+
+    // Per-part summary.  These counts are geometry-only: a part with candidates
+    // here can still end up ungraspable once select() tests them against the
+    // parts actually assembled at a given DFS node.  A part with zero candidates
+    // has no viable grasp on its own geometry at all, independent of the assembly.
+    for (auto const& job : jobs)
+    {
+        const auto& faces = grasp_candidates_[job.part->getId()].faces;
+        size_t total = 0;
+        for (auto const& f : faces) total += f.size();
+        RCLCPP_INFO(logger(),
+                    "  %-40s %zu candidate(s) on %zu face(s)",
+                    job.part->getName().c_str(), total, faces.size());
+    }
 }
 
 void Assembler::assignExternalBayPositions()
@@ -1320,18 +1461,15 @@ void Assembler::generateNegatives()
 
         part->setCentroidPosition(gp_Pnt(transform.X(), transform.Y(), JIG_CENTER_Z));
 
-        CradleGenerator cradle_gen(part->getName(), *part->getShape());
+        CradleGenerator cradle_gen(part->getName(), *part->getShape(), cradle_scaling_distance_);
 
         float part_jig_z_offset = cradle_gen.createSimpleNegative(BAY_SIZES[part->getBaySizeIndex()], part->getBayIndex(), run_output_dir_);
 
-        RCLCPP_INFO(logger(), "Jig z offset (height above jig base): %f", part_jig_z_offset);
+        RCLCPP_INFO(logger(), "Jig z offset: %f", part_jig_z_offset);
 
-        RCLCPP_INFO(logger(), "Setting part transform %f %f %f", transform.X(), transform.Y(), (double)part_jig_z_offset);
+        RCLCPP_INFO(logger(), "Setting part transform %f %f %f", transform.X(), transform.Y(), JIG_CENTER_Z + part_jig_z_offset);
 
-        // part_jig_z_offset is the part centroid height above the jig base plate (Z=0 in
-        // the STL).  The jig base is at Z=0 in world coordinates, so no additional offset
-        // is needed — using JIG_CENTER_Z here would shift parts below the jig.
-        initial_assembly_->setUnassembledPart(part, gp_Pnt(transform.X(), transform.Y(), part_jig_z_offset));
+        initial_assembly_->setUnassembledPart(part, gp_Pnt(transform.X(), transform.Y(), JIG_CENTER_Z + part_jig_z_offset));
 
     }
 }
@@ -1341,65 +1479,138 @@ void Assembler::generateNegatives()
    In path mode, grasps are found per-edge during DFS and propagated via
    edge_part_/edge_grasp_ fields on AssemblyNode — this function is skipped.
 */
-void Assembler::generateGrasps()
+// Update every scene object's pose from the target assembly's current transforms
+// and re-sync the collision backend.
+//
+// The scene is populated once, in generateInitialAssembly().  But
+// alignAssemblyPathToInitialAssembly() later translates the whole assembly onto
+// the printed base part, which leaves the collision objects behind at their
+// pre-alignment poses.  Any collision query made after that point then tests the
+// nozzle against geometry hundreds of mm away and passes vacuously — the OCCT-only
+// seal check still fires, so the failure looks like a plausible result rather than
+// an obviously broken one.  Callers that query collisions must refresh first.
+//
+// Only poses need updating: the cached local-frame shapes are built about each
+// shape's own bbox centroid, so a pure translation leaves them unchanged.
+void Assembler::refreshCollisionScene()
 {
-    if (!collision_adapter_ || !nozzle_mesh_) return;
+    if (!collision_adapter_ || !target_assembly_) return;
 
-    // Ensure shapes are at assembly positions for consistent Coal / OCCT queries.
-    target_assembly_->setPartTransforms();
+    for (auto const& [part, transform] : target_assembly_->getAssembledPartTransforms())
+    {
+        const std::string id = part->getName() + "_" + std::to_string(part->getId());
+        if (!scene_.has_object(id)) continue;
+
+        gp_Trsf pose;
+        pose.SetTranslation(gp_Vec(transform.X() * 0.001,
+                                   transform.Y() * 0.001,
+                                   transform.Z() * 0.001));
+        scene_.set_pose(id, pose);
+    }
+
+    collision_adapter_->sync(scene_);
+}
+
+// Build the list of (part, assembled-part-IDs) pairs to grasp-check.
+//
+// A part is only ever grasped at its own step in the sequence, against whatever
+// is already in place at that moment.  Checking it against the *finished*
+// assembly instead asks a question the robot never faces: a part placed early
+// can be completely enclosed by the time the build is done, so a perfectly good
+// grasp is reported as impossible.  MACH_1's motor is exactly that case — it goes
+// on first, onto the bare chassis, but ends up surrounded by the clamp, two bolts
+// and two gears.
+//
+// Falls back to the full assembly when there is no path (jig/grasp-only mode),
+// where there is no sequence to take a step from.
+std::vector<std::pair<std::shared_ptr<Part>, std::vector<std::string>>>
+Assembler::graspEvaluationContexts() const
+{
+    std::vector<std::pair<std::shared_ptr<Part>, std::vector<std::string>>> contexts;
+
+    if (!assembly_path_.empty())
+    {
+        for (auto const& node : assembly_path_)
+        {
+            if (!node || !node->edge_part_) continue;
+            auto part = node->edge_part_;
+            if (part->getType() != Part::EXTERNAL) continue;
+
+            // The node's assembled set includes the edge part itself; the nozzle
+            // only has to clear everything that was already there.
+            std::vector<std::string> ids;
+            for (auto const& [other, _] : node->assembly_->getAssembledPartTransforms())
+            {
+                if (other->getId() == part->getId()) continue;
+                ids.push_back(other->getName() + "_" + std::to_string(other->getId()));
+            }
+            contexts.emplace_back(part, std::move(ids));
+        }
+        return contexts;
+    }
 
     const auto& all_parts = target_assembly_->getAssembledPartTransforms();
-
     for (auto const& [part, transform] : all_parts)
     {
-        // (cancellation hook — currently a no-op; add std::atomic<bool>* flag if needed)
-
         if (part->getType() != Part::EXTERNAL) continue;
 
-        // Build scene IDs for every other assembled part.
-        std::vector<std::string> assembled_ids;
-        assembled_ids.reserve(all_parts.size() - 1);
+        std::vector<std::string> ids;
+        ids.reserve(all_parts.size() - 1);
         for (auto const& [other, _] : all_parts)
         {
             if (other->getId() == part->getId()) continue;
-            assembled_ids.push_back(other->getName() + "_" + std::to_string(other->getId()));
+            ids.push_back(other->getName() + "_" + std::to_string(other->getId()));
+        }
+        contexts.emplace_back(part, std::move(ids));
+    }
+    return contexts;
+}
+
+void Assembler::generateGrasps()
+{
+    if (!collision_adapter_ || !nozzle_shape_) return;
+
+    // Ensure shapes are at assembly positions for consistent OCCT queries.
+    target_assembly_->setPartTransforms();
+    refreshCollisionScene();
+
+    grasp_attempts_.clear();
+
+    for (auto const& [part, assembled_ids] : graspEvaluationContexts())
+    {
+        // (cancellation hook — currently a no-op; add std::atomic<bool>* flag if needed)
+
+        auto it = grasp_candidates_.find(part->getId());
+        if (it == grasp_candidates_.end())
+        {
+            RCLCPP_WARN(logger(), "generateGrasps: no precomputed candidates for %s",
+                        part->getName().c_str());
+            continue;
         }
 
-        auto grasp = VacuumGraspGenerator::generate(
-            part, *collision_adapter_, nozzle_mesh_, assembled_ids);
+        // Same call the DFS made at this part's node, with the same cached
+        // candidates and the same parts in place — so this reproduces the grasp
+        // the sequence was validated with, rather than searching for a new one.
+        // debug_out captures the full picture for the visualiser at no extra cost.
+        auto grasp = VacuumGraspGenerator::select(
+            part, it->second, *collision_adapter_, nozzle_shape_,
+            assembled_ids, &grasp_attempts_);
 
         if (grasp)
             part->setVacuumGrasp(*grasp);
         else
-            RCLCPP_WARN(logger(), "generateGrasps: no grasp found for %s",
-                        part->getName().c_str());
+            RCLCPP_WARN(logger(),
+                        "generateGrasps: no grasp found for %s (against %zu part(s) in place)",
+                        part->getName().c_str(), assembled_ids.size());
     }
 }
 
+// The attempts recorded by generateGrasps().  This deliberately does NOT
+// re-run the search: doing so used to produce a second, independent answer that
+// could disagree with the grasp the machine was given.  Positions are kept in
+// world mm and are translated along with the assembly by
+// alignAssemblyPathToInitialAssembly().
 std::vector<GraspAttempt> Assembler::debugGrasps()
 {
-    std::vector<GraspAttempt> all_attempts;
-    if (!collision_adapter_ || !nozzle_mesh_ || !target_assembly_) return all_attempts;
-
-    target_assembly_->setPartTransforms();
-
-    const auto& all_parts = target_assembly_->getAssembledPartTransforms();
-
-    for (auto const& [part, transform] : all_parts)
-    {
-        if (part->getType() != Part::EXTERNAL) continue;
-
-        std::vector<std::string> assembled_ids;
-        assembled_ids.reserve(all_parts.size() - 1);
-        for (auto const& [other, _] : all_parts)
-        {
-            if (other->getId() == part->getId()) continue;
-            assembled_ids.push_back(other->getName() + "_" + std::to_string(other->getId()));
-        }
-
-        VacuumGraspGenerator::generate(
-            part, *collision_adapter_, nozzle_mesh_, assembled_ids, &all_attempts);
-    }
-
-    return all_attempts;
+    return grasp_attempts_;
 }

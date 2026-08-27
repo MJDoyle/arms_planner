@@ -24,7 +24,7 @@ const extern double JIG_HEIGHT;
 const extern double JIG_CENTER_Z;
 
 // BRepMesh chord tolerance used for the canonical part tessellation (mm).
-// The CoalAdapter safety margin is MESH_DEFLECTION_MM * 0.5 * 0.001 m.
+// The OcctCollisionAdapter safety margin is MESH_DEFLECTION_MM * 0.5 * 0.001 m.
 const extern double MESH_DEFLECTION_MM;
 
 #endif

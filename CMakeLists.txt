@@ -13,6 +13,7 @@ find_package(OpenCASCADE REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(coal REQUIRED)
 find_package(Boost REQUIRED COMPONENTS json)
+find_package(Threads REQUIRED)
 
 # ---- arms_planner_core_lib (no ROS, no PIC restriction) ----
 add_library(arms_planner_core_lib STATIC
@@ -50,6 +51,7 @@ target_link_libraries(arms_planner_core_lib PUBLIC
   ${OpenCASCADE_LIBRARIES}
   yaml-cpp::yaml-cpp
   coal::coal
+  Threads::Threads
 )
 
 # Required when the static lib is linked into a shared object (assembler_node.so)

@@ -187,6 +187,22 @@ TopoDS_Shape UniformScaleShape(TopoDS_Shape shape, Standard_Real scaling)
     return BRepBuilderAPI_Transform(shape, trsf, true).Shape();
 }
 
+TopoDS_Shape LocalFrameShapeM(const TopoDS_Shape& shape_mm)
+{
+    const gp_Pnt centroid = ShapeCentroid(shape_mm);
+
+    // Translate centroid to origin, then scale mm → m.
+    // Combined: p_result = 0.001 * (p_mm - centroid)
+    gp_Trsf translate;
+    translate.SetTranslation(gp_Vec(-centroid.X(), -centroid.Y(), -centroid.Z()));
+
+    gp_Trsf scale;
+    scale.SetScale(gp_Pnt(0, 0, 0), 0.001);
+
+    scale.Multiply(translate);  // scale = scale * translate → scale(translate(p))
+    return BRepBuilderAPI_Transform(shape_mm, scale, true).Shape();
+}
+
 TopoDS_Shape SubtractShapeBFromA(TopoDS_Shape shape_A, TopoDS_Shape shape_B)
 {
     // Perform the subtraction: A - B

@@ -125,6 +125,95 @@ std::vector<uint8_t> mesh_to_glb(const MeshAsset& mesh)
     return glb;
 }
 
+std::vector<uint8_t> mesh_to_glb_coloured(const MeshAsset& mesh,
+                                           float r, float g, float b, float a)
+{
+    const size_t n_verts   = mesh.vertices.size();
+    const size_t n_tris    = mesh.triangles.size();
+    const size_t n_indices = n_tris * 3;
+
+    std::vector<uint8_t> bin;
+    bin.reserve(n_verts * 12 + n_indices * 4);
+
+    float xmin =  std::numeric_limits<float>::max();
+    float ymin =  std::numeric_limits<float>::max();
+    float zmin =  std::numeric_limits<float>::max();
+    float xmax = -std::numeric_limits<float>::max();
+    float ymax = -std::numeric_limits<float>::max();
+    float zmax = -std::numeric_limits<float>::max();
+
+    for (auto const& v : mesh.vertices)
+    {
+        float x = static_cast<float>(v[0]);
+        float y = static_cast<float>(v[1]);
+        float z = static_cast<float>(v[2]);
+        write_f32(bin, x);  write_f32(bin, y);  write_f32(bin, z);
+        xmin = std::min(xmin, x);  ymin = std::min(ymin, y);  zmin = std::min(zmin, z);
+        xmax = std::max(xmax, x);  ymax = std::max(ymax, y);  zmax = std::max(zmax, z);
+    }
+
+    const size_t index_byte_offset = bin.size();
+
+    for (auto const& tri : mesh.triangles)
+    {
+        write_u32(bin, static_cast<uint32_t>(tri[0]));
+        write_u32(bin, static_cast<uint32_t>(tri[1]));
+        write_u32(bin, static_cast<uint32_t>(tri[2]));
+    }
+
+    while (bin.size() % 4 != 0) bin.push_back(0);
+
+    auto fmt_f = [](float v) -> std::string {
+        std::ostringstream ss;
+        ss << v;
+        return ss.str();
+    };
+
+    const size_t vert_byte_len = n_verts * 12;
+    const size_t idx_byte_len  = n_indices * 4;
+
+    std::ostringstream json;
+    json << R"({"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"mesh":0}],)"
+         << R"("meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1,"mode":4,"material":0}]}],)"
+         << R"("materials":[{"pbrMetallicRoughness":{"baseColorFactor":[)"
+         <<     fmt_f(r) << "," << fmt_f(g) << "," << fmt_f(b) << "," << fmt_f(a)
+         << R"(]}}],)"
+         << R"("accessors":[)"
+         <<   R"({"bufferView":0,"componentType":5126,"count":)" << n_verts
+         <<     R"(,"type":"VEC3","min":[)" << fmt_f(xmin) << "," << fmt_f(ymin) << "," << fmt_f(zmin)
+         <<     R"(],"max":[)" << fmt_f(xmax) << "," << fmt_f(ymax) << "," << fmt_f(zmax) << "]},"
+         <<   R"({"bufferView":1,"componentType":5125,"count":)" << n_indices << R"(,"type":"SCALAR"})"
+         << R"(],"bufferViews":[)"
+         <<   R"({"buffer":0,"byteOffset":0,"byteLength":)" << vert_byte_len << R"(,"target":34962},)"
+         <<   R"({"buffer":0,"byteOffset":)" << index_byte_offset << R"(,"byteLength":)" << idx_byte_len << R"(,"target":34963})"
+         << R"(],"buffers":[{"byteLength":)" << (vert_byte_len + idx_byte_len) << "}]}";
+
+    std::string json_str = json.str();
+    while (json_str.size() % 4 != 0) json_str += ' ';
+
+    const uint32_t total_len =
+        12
+        + 8 + static_cast<uint32_t>(json_str.size())
+        + 8 + static_cast<uint32_t>(bin.size());
+
+    std::vector<uint8_t> glb;
+    glb.reserve(total_len);
+
+    write_u32(glb, 0x46546C67u);
+    write_u32(glb, 2u);
+    write_u32(glb, total_len);
+
+    write_u32(glb, static_cast<uint32_t>(json_str.size()));
+    write_u32(glb, 0x4E4F534Au);
+    glb.insert(glb.end(), json_str.begin(), json_str.end());
+
+    write_u32(glb, static_cast<uint32_t>(bin.size()));
+    write_u32(glb, 0x004E4942u);
+    glb.insert(glb.end(), bin.begin(), bin.end());
+
+    return glb;
+}
+
 // ---------------------------------------------------------------------------
 // GLB reader — the exact inverse of mesh_to_glb().
 // ---------------------------------------------------------------------------

@@ -41,6 +41,11 @@ class GraspRecord:
     y_mm: float
     z_mm: float
     status: str         # "accepted" | "body_collision" | "assembly_collision" | "seal_failed"
+    part_id: Optional[int] = None  # absent in .arms files written before this field existed
+    # True on the one accepted candidate per part that the planner actually
+    # picked (closest to the centre of mass).  False on the other accepted
+    # candidates, which were viable but not selected.  Absent in older files.
+    chosen: bool = False
 
 
 @dataclass
@@ -55,6 +60,28 @@ class StageRecord:
 @dataclass
 class JigRecord:
     stl_file: str
+
+
+@dataclass
+class BackgroundRecord:
+    """A static environment mesh baked into the .arms file by arms-plan.
+
+    The GLB's vertices are already in world-space metres — arms-plan applies
+    the pose from background_models.txt at write time — so unlike parts these
+    need no per-object placement, only the viewer's scene-centring offset.
+    """
+    file: str
+    r: float = 0.5      # base colour, linear 0..1
+    g: float = 0.5
+    b: float = 0.5
+
+    @property
+    def color_rgb255(self) -> tuple[int, int, int]:
+        """Base colour as the 0-255 int triple viser expects."""
+        return tuple(  # type: ignore[return-value]
+            max(0, min(255, int(round(c * 255))))
+            for c in (self.r, self.g, self.b)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +143,14 @@ class SceneDocument:
     gcode_file: str
     command_file: str
 
+    # Static environment meshes.  Defaulted so .arms files written before
+    # background support existed still load.
+    background: list[BackgroundRecord] = field(default_factory=list)
+
+    # GLB of the vacuum nozzle the planner used, in local-frame metres with its
+    # contact face at z = -0.01 m.  Empty for files written before it was baked in.
+    nozzle_file: str = ""
+
     # Set when loaded from a file; None if constructed programmatically.
     arms_path: Optional[str] = field(default=None, compare=False)
 
@@ -157,11 +192,23 @@ class SceneDocument:
                 y_mm=float(g["y_mm"]),
                 z_mm=float(g["z_mm"]),
                 status=g["status"],
+                part_id=g.get("part_id"),
+                chosen=bool(g.get("chosen", False)),
             )
             for g in data.get("grasps", [])
         ]
 
         jigs = [JigRecord(stl_file=j["stl_file"]) for j in data.get("jigs", [])]
+
+        background = [
+            BackgroundRecord(
+                file=b["file"],
+                r=float(b.get("r", 0.5)),
+                g=float(b.get("g", 0.5)),
+                b=float(b.get("b", 0.5)),
+            )
+            for b in data.get("background", [])
+        ]
 
         return cls(
             version=data["version"],
@@ -174,6 +221,8 @@ class SceneDocument:
             jigs=jigs,
             gcode_file=data.get("gcode_file", ""),
             command_file=data.get("command_file", ""),
+            background=background,
+            nozzle_file=data.get("nozzle_file", ""),
             arms_path=arms_path,
         )
 
@@ -183,6 +232,26 @@ class SceneDocument:
         """Return (vertices float32 Nx3 in metres, triangles uint32 Mx3) for a part."""
         glb_bytes = self.read_entry(part.mesh_file)
         return _parse_glb(glb_bytes)
+
+    def background_vertices_triangles(
+        self, bg: BackgroundRecord
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return (vertices float32 Nx3, triangles uint32 Mx3) for a background mesh.
+
+        Vertices are already world-space metres, not local-frame like parts.
+        """
+        return _parse_glb(self.read_entry(bg.file))
+
+    def nozzle_vertices_triangles(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return (vertices float32 Nx3 in metres, triangles uint32 Mx3) for the nozzle.
+
+        Vertices are local-frame: the nozzle centroid is at the origin, so placing
+        this at a GraspRecord's (x_mm, y_mm, z_mm) puts the tool exactly where the
+        planner tested it.  Raises if the file carries no nozzle.
+        """
+        if not self.nozzle_file:
+            raise RuntimeError("this .arms file contains no nozzle mesh")
+        return _parse_glb(self.read_entry(self.nozzle_file))
 
     def read_entry(self, entry_name: str) -> bytes:
         """Read a raw entry from the .arms zip."""
