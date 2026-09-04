@@ -55,7 +55,7 @@ private:
 
     // Tessellate `shape` on first use and build its BVH; cached in shape_geom_cache_.
     std::shared_ptr<coal::CollisionGeometry>
-    get_or_build_geometry(const TopoDS_Shape& shape);
+    get_or_build_geometry(const std::shared_ptr<TopoDS_Shape>& shape);
 
     double safety_margin_m_;
 
@@ -65,7 +65,14 @@ private:
     // MeshAsset raw pointer → coal geometry (avoids rebuilding BVH for unchanged meshes)
     std::map<const MeshAsset*, std::shared_ptr<coal::CollisionGeometry>> mesh_geom_cache_;
 
-    // TopoDS_Shape raw pointer → coal geometry (avoids re-tessellating shapes
-    // reused across many add_or_update calls, e.g. the nozzle)
-    std::map<const TopoDS_Shape*, std::shared_ptr<coal::CollisionGeometry>> shape_geom_cache_;
+    // TopoDS_Shape raw pointer → its owning handle plus the coal geometry.
+    //
+    // The entry keeps the shape ALIVE.  The key is a raw pointer, so a caller
+    // that lets its shape die frees that address for reuse — a later allocation
+    // landing there would hit this cache and be handed the previous shape's BVH,
+    // silently colliding against the wrong geometry.  Owning the shape makes the
+    // key unique for as long as the entry exists.
+    std::map<const TopoDS_Shape*,
+             std::pair<std::shared_ptr<TopoDS_Shape>,
+                       std::shared_ptr<coal::CollisionGeometry>>> shape_geom_cache_;
 };

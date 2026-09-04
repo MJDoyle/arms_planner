@@ -64,6 +64,9 @@ public:
     void setGeneratePath(bool v) { generate_path_ = v; }
     void setCollisionVolumeThreshold(double v) { collision_volume_threshold_ = v; }
     void setCradleScalingDistance(float v) { cradle_scaling_distance_ = v; }
+
+    // 0 disables splitting entirely.
+    void setMaxSplits(int v) { max_splits_ = v; }
     void setToolConfig(const ToolConfig& cfg) { tool_config_ = cfg; }
 
     void reset();  // Clear all run-specific state so a new model can be loaded cleanly
@@ -137,9 +140,28 @@ private:
     //   - Coal z-step lift (all parts)
     //   - VacuumGraspGenerator with Coal assembly check (external parts)
     //   - Gripper-vs-jig pick check (external parts with bay assigned)
+    // Successors reachable only by splitting a printed part.  Consulted solely
+    // when findNodeNeighbours() comes back empty — see Assembler.cpp.
+    std::vector<std::shared_ptr<AssemblyNode>> findSplitNeighbours(
+        std::shared_ptr<AssemblyNode> node);
+
+    // Register a freshly cut piece in the scene and collision backend so the
+    // feasibility checks and later DFS nodes can see it.
+    std::shared_ptr<Part> registerSplitPiece(const TopoDS_Shape& shape,
+                                             const std::string&  name);
+
+    // Warn when a cut leaves a large unsupported first layer.  Advisory only:
+    // support is the model designer's call, this just flags it.
+    void warnIfUnsupported(const TopoDS_Shape& upper,
+                           const TopoDS_Shape& lower,
+                           const TopoDS_Shape& placed_part,
+                           double z_cut,
+                           const std::string& name) const;
+
     std::optional<gp_Pnt> edge_feasible(
         std::shared_ptr<Part> part,
-        const PartTransformMap& assembled);
+        const PartTransformMap& assembled,
+        std::vector<std::shared_ptr<Part>>* blockers = nullptr);
 
     std::vector<std::shared_ptr<AssemblyNode>> breadthFirstZAssembly();
 
@@ -194,6 +216,38 @@ private:
     bool generate_path_ = true;
     double collision_volume_threshold_ = 0.0;
     float cradle_scaling_distance_ = 0.2f;
+
+    // Maximum number of printed-part splits the search may use.  Splits are a
+    // fallback for dead-end states; a piece produced by one may itself be split
+    // again, so this caps the total across the whole search.
+    // Splits taken on the chosen path.  The source part is still printed as one
+    // object; z_cut_rel is where its g-code is divided so the freed part can be
+    // dropped in mid-print.
+    struct SplitRecord {
+        std::shared_ptr<Part> source, lower, upper, freed;
+        double z_cut_rel = 0.0;   // mm above the part's own underside
+    };
+    std::vector<SplitRecord> splits_;
+
+    // Local-frame collision shape per part ID, built on first use and kept alive
+    // for the run.  Also keeps the adapter's geometry cache keys stable.
+    std::map<size_t, std::shared_ptr<TopoDS_Shape>> lf_shape_cache_;
+
+    // Slicer output divided at each split height; one entry when nothing is split.
+    std::vector<std::vector<std::string>> slicer_gcode_segments_;
+
+    static std::vector<std::vector<std::string>> splitGcodeAtHeights(
+        const std::vector<std::string>& gcode, std::vector<double> heights);
+
+    bool isSplitPiece(const std::shared_ptr<Part>& p) const {
+        for (auto const& s : splits_)
+            if (p == s.lower || p == s.upper) return true;
+        return false;
+    }
+
+    int    max_splits_   = 2;
+    int    splits_used_  = 0;
+    size_t next_split_id_ = 0;
     ToolConfig tool_config_;
     std::string run_output_dir_;
     std::string slicer_config_dir_;

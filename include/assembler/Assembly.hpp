@@ -31,6 +31,10 @@ public:
 
     void setUnassembledPart(std::shared_ptr<Part> part, gp_Pnt position) { unassembled_part_transforms_[part] = position; }
 
+    // Used when a printed part is superseded by the pieces it was split into.
+    void removeUnassembledPart(std::shared_ptr<Part> part) { unassembled_part_transforms_.erase(part); }
+    void removeAssembledPart(std::shared_ptr<Part> part)   { assembled_part_transforms_.erase(part); }
+
     PartTransformMap getAssembledPartTransforms() { return assembled_part_transforms_; }
 
     PartTransformMap getUnassembledPartTransforms() { return unassembled_part_transforms_; }
@@ -72,6 +76,25 @@ struct AssemblyNode {
     // Grasp for edge_part_ (local frame, relative to centroid, mm).
     // Zero for parts that don't need a grasp (internal, screws).
     gp_Pnt edge_grasp_;
+
+    // ---- Split step (optional second phase) ----
+    // Set when this node was reached by splitting a printed part to free
+    // edge_part_.  The transition then has two phases, in this order:
+    //   1. split split_source_ at z = split_z_, remove split_upper_
+    //   2. remove edge_part_
+    // They are recorded together because the split exists only to enable that
+    // removal — taking one without the other would cut a part for nothing.
+    // In assembly (forward) order this reads: print split_lower_, place
+    // edge_part_, then print split_upper_ on top.
+    bool                  is_split_step_ = false;
+    std::shared_ptr<Part> split_source_;   // the printed part that was cut
+    std::shared_ptr<Part> split_lower_;    // piece that stays in place
+    std::shared_ptr<Part> split_upper_;    // piece removed in phase 1
+    double                split_z_ = 0.0;  // cut height, world mm
+    // Cut height measured from the printed part's own underside.  Frame-independent,
+    // so it survives the later alignment translation and maps straight onto the
+    // slicer's Z (parts are printed with their base on the bed at Z=0).
+    double                split_z_rel_ = 0.0;
 
     bool operator <(const AssemblyNode& rhs) const
     {

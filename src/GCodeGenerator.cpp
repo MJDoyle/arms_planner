@@ -4,17 +4,35 @@
 #include "assembler/Config.hpp"
 #include "assembler/Logger.hpp"
 
-void GCodeGenerator::generate(std::shared_ptr<Assembly> initial_assembly, std::shared_ptr<Assembly> target_assembly, std::shared_ptr<Part> base_part, std::vector<size_t> part_addition_order, std::vector<std::string> printer_gcode, const std::string& output_dir)
+void GCodeGenerator::generate(std::shared_ptr<Assembly> initial_assembly,
+                              std::shared_ptr<Assembly> target_assembly,
+                              std::shared_ptr<Part> base_part,
+                              std::vector<size_t> part_addition_order,
+                              const std::vector<std::vector<std::string>>& printer_gcode_segments,
+                              const std::map<size_t, size_t>& print_segment_after_part,
+                              const std::string& output_dir)
 {
     std::vector<std::string> gcode;
 
-    //Add print GCode
-    gcode.push_back(";PRINT COMMAND");
+    auto emit_segment = [&](size_t index, bool resuming) {
+        if (index >= printer_gcode_segments.size()) return;
+        if (resuming)
+        {
+            // The vacuum tool is still fitted from the insertion — swap back to
+            // the extruder before laying down the next layer.
+            gcode.push_back(";RESUME PRINT COMMAND");
+            toolChangeExtruder(gcode);
+            moveToSafeHeight(gcode);
+        }
+        else
+        {
+            gcode.push_back(";PRINT COMMAND");
+        }
+        for (const std::string& print_line : printer_gcode_segments[index])
+            gcode.push_back(print_line);
+    };
 
-    for (std::string print_line : printer_gcode)
-    {
-        gcode.push_back(print_line);
-    }
+    emit_segment(0, false);
 
     //Iterate through the part addition order, find the part in the initial and target assemblies, generate the correct actions
     for (size_t part_id : part_addition_order)
@@ -68,6 +86,11 @@ void GCodeGenerator::generate(std::shared_ptr<Assembly> initial_assembly, std::s
             wait(gcode, 500);
 
             moveToSafeHeight(gcode, 2000);
+
+            // If the print was interrupted to drop this part in, carry on now.
+            auto resume = print_segment_after_part.find(part_id);
+            if (resume != print_segment_after_part.end())
+                emit_segment(resume->second, true);
         }
 
         else if (part_type == Part::SCREW)

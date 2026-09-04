@@ -401,6 +401,8 @@ static void print_usage(const char* argv0)
         << "                             (pose in mm + quaternion; same format as the\n"
         << "                              ROS2 background_models parameter).\n"
         << "                             May be repeated for multiple meshes.\n"
+        << "  --max-splits <n>           Max printed-part splits the planner may use to\n"
+        << "                             free a trapped part (default 2, 0 disables)\n"
         << "  --no-grasps                Skip grasp generation\n"
         << "  --no-jigs                  Skip jig STL generation\n"
         << "  --no-path                  Skip path planning\n";
@@ -427,6 +429,7 @@ int main(int argc, char* argv[])
     bool generate_jigs   = true;
     bool generate_path   = true;
     std::vector<BackgroundEntry> background_entries;
+    int  max_splits      = 2;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -443,6 +446,7 @@ int main(int argc, char* argv[])
             }
             background_entries.push_back(std::move(*entry));
         }
+        else if (arg == "--max-splits" && i + 1 < argc) { max_splits = std::atoi(argv[++i]); }
         else if (arg == "--no-grasps") { generate_grasps = false; }
         else if (arg == "--no-jigs")   { generate_jigs   = false; }
         else if (arg == "--no-path")   { generate_path   = false; }
@@ -513,6 +517,7 @@ int main(int argc, char* argv[])
         assembler.setGenerateGrasps(generate_grasps);
         assembler.setGenerateJigs(generate_jigs);
         assembler.setGeneratePath(generate_path);
+        assembler.setMaxSplits(max_splits);
         assembler.setTargetAssembly(target_assembly);
         if (!slicer_config_dir.empty())
             assembler.setSlicerConfigDir(slicer_config_dir);

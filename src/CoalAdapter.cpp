@@ -83,15 +83,18 @@ CoalAdapter::get_or_build_geometry(const MeshAsset& mesh)
 }
 
 std::shared_ptr<coal::CollisionGeometry>
-CoalAdapter::get_or_build_geometry(const TopoDS_Shape& shape)
+CoalAdapter::get_or_build_geometry(const std::shared_ptr<TopoDS_Shape>& shape_ptr)
 {
+    const TopoDS_Shape& shape = *shape_ptr;
+
     // Cache lookup by pointer identity — callers (VacuumGraspGenerator, the
     // z-lift check) reuse the same shared_ptr across many add_or_update
     // calls with only the pose changing, so this tessellates each transient
-    // shape (nozzle, lifted-part copy) exactly once.
+    // shape (nozzle, lifted-part copy) exactly once.  The entry owns the shape
+    // so its address cannot be recycled under the cache; see the header.
     auto it = shape_geom_cache_.find(&shape);
     if (it != shape_geom_cache_.end())
-        return it->second;
+        return it->second.second;
 
     // NOTE: deliberately NOT Tessellator::tessellate() here — that function
     // expects a raw millimetre shape and itself converts mm -> m and
@@ -133,7 +136,7 @@ CoalAdapter::get_or_build_geometry(const TopoDS_Shape& shape)
     }
 
     auto model = build_bvh(vertices, triangles);
-    shape_geom_cache_[&shape] = model;
+    shape_geom_cache_[&shape] = {shape_ptr, model};
     return model;
 }
 
@@ -145,7 +148,7 @@ void CoalAdapter::add_or_update(const std::string& id,
                                  std::shared_ptr<TopoDS_Shape> shape,
                                  const gp_Trsf& pose)
 {
-    auto geom = get_or_build_geometry(*shape);
+    auto geom = get_or_build_geometry(shape);
     objects_[id] = std::make_shared<coal::CollisionObject>(geom, to_coal_transform(pose));
 }
 

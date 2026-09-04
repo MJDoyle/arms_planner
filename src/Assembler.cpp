@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
+#include <algorithm>
 
 #include <atomic>
 #include <mutex>
@@ -72,6 +73,7 @@ void Assembler::reset()
     collision_adapter_.reset();
     nozzle_mesh_.reset();
     nozzle_shape_.reset();
+    splits_used_ = 0;
 
     initialisePartBays();
 }
@@ -205,6 +207,61 @@ void Assembler::generateAssemblySequence()
         assembly_path_ = depthFirstZAssembly();   //All parts in the path are in the target_assembly position
         saveAssemblyPath();
 
+        // Reconcile the part list with any split taken on the chosen path.  A
+        // part that was cut is superseded by its two pieces: the finished
+        // assembly contains the pieces, not the original, and the original must
+        // not also be printed.  base_node->assembly_ IS target_assembly_, so
+        // rewriting it here also fixes the first node of the path.
+        for (const auto& node : assembly_path_)
+        {
+            if (!node->is_split_step_ || !node->split_source_) continue;
+
+            RCLCPP_INFO(logger(),
+                        "Replacing %s with its two pieces (%s, %s) in the build",
+                        node->split_source_->getName().c_str(),
+                        node->split_lower_->getName().c_str(),
+                        node->split_upper_->getName().c_str());
+
+            target_assembly_->removeAssembledPart(node->split_source_);
+            target_assembly_->setAssembledPart(
+                node->split_lower_, ShapeCentroid(*node->split_lower_->getShape()));
+            target_assembly_->setAssembledPart(
+                node->split_upper_, ShapeCentroid(*node->split_upper_->getShape()));
+
+            // The source stays in initial_assembly_ on purpose.  A cut piece is a
+            // sequencing concept, not a printing one: the printer still lays down
+            // one continuous object, and it is the *g-code* that gets divided at
+            // the cut height.  Slicing the pieces separately would ask PrusaSlicer
+            // to slice a body floating 15 mm above the bed.
+            splits_.push_back({node->split_source_, node->split_lower_,
+                               node->split_upper_, node->edge_part_, node->split_z_rel_});
+        }
+
+        // Pieces created while exploring branches that were abandoned would
+        // otherwise still be printed.
+        {
+            std::set<size_t> on_path;
+            for (const auto& node : assembly_path_)
+                for (auto const& [p, _] : node->assembly_->getUnassembledPartTransforms())
+                    on_path.insert(p->getId());
+            for (auto const& [p, _] : target_assembly_->getAssembledPartTransforms())
+                on_path.insert(p->getId());
+            // A split source is absent from the finished assembly — its pieces are
+            // there instead — but it is still the object the printer lays down, so
+            // it must survive this pass.
+            for (auto const& sp : splits_)
+                on_path.insert(sp.source->getId());
+
+            std::vector<std::shared_ptr<Part>> drop;
+            for (auto const& [p, _] : initial_assembly_->getUnassembledPartTransforms())
+                if (!on_path.count(p->getId())) drop.push_back(p);
+            for (const auto& p : drop) {
+                RCLCPP_INFO(logger(), "Dropping unused part %s (id %ld)",
+                            p->getName().c_str(), p->getId());
+                initial_assembly_->removeUnassembledPart(p);
+            }
+        }
+
         // Propagate the edge grasps found during DFS onto each part so that
         // downstream steps (generateCommandFile) can use part->getVacuumGrasp().
         if (generate_grasps_)
@@ -320,7 +377,18 @@ Generates a direct GCode file that can be uploaded to ARMS and 'printed' directl
 */
 void Assembler::generateGCodeFile(std::vector<size_t> part_addition_order)
 {
-    GCodeGenerator::generate(initial_assembly_, target_assembly_, base_part_, part_addition_order, slicer_gcode_, run_output_dir_);
+    // Which print segment resumes after each mid-build insertion.
+    std::map<size_t, size_t> print_segment_after_part;
+    for (size_t i = 0; i < splits_.size(); ++i)
+        if (splits_[i].freed)
+            print_segment_after_part[splits_[i].freed->getId()] = i + 1;
+
+    auto segments = slicer_gcode_segments_;
+    if (segments.empty()) segments.push_back(slicer_gcode_);
+
+    GCodeGenerator::generate(initial_assembly_, target_assembly_, base_part_,
+                             part_addition_order, segments,
+                             print_segment_after_part, run_output_dir_);
 }
 
 /*  Uses the grasps, part positions and path to generate the command file to be sent to ARMS
@@ -414,6 +482,28 @@ void Assembler::generateCommandFile(std::vector<size_t> part_addition_order)
         designate_part_command["command-properties"]["grasp-pos-z"] = part->getVacuumGrasp().Z();
 
         commands.push_back(designate_part_command);
+    }
+
+    // Designate the print phases.  A split part is printed in two goes with the
+    // freed part dropped in between; the machine needs to know where the print
+    // pauses and which part goes in at that point.
+    for (size_t i = 0; i < splits_.size(); ++i)
+    {
+        const auto& sp = splits_[i];
+
+        YAML::Node print_phase;
+        print_phase["command-type"] = "DESIGNATE_PRINT_PHASE";
+        print_phase["command-properties"]["phase-index"]      = static_cast<int>(i + 1);
+        print_phase["command-properties"]["print-segment"]    = static_cast<int>(i + 1);
+        print_phase["command-properties"]["source-part-id"]   = sp.source->getId();
+        print_phase["command-properties"]["source-part-name"] = sp.source->getName();
+        print_phase["command-properties"]["cut-height"]       = sp.z_cut_rel;
+        if (sp.freed)
+        {
+            print_phase["command-properties"]["insert-part-id"]   = sp.freed->getId();
+            print_phase["command-properties"]["insert-part-name"] = sp.freed->getName();
+        }
+        commands.push_back(print_phase);
     }
 
     //Designate screws
@@ -681,6 +771,8 @@ bool Assembler::arrangeInternalParts()
     {
         if (part->getType() != Part::INTERNAL)
             continue;
+        if (isSplitPiece(part))   // printed as part of its source object
+            continue;
 
         while (true)
         {
@@ -724,6 +816,65 @@ bool Assembler::arrangeInternalParts()
 
 /* Generate GCode for the internal parts, the print positions of which are given by the initial assembly
 */
+// Divide slicer output at the given heights, in ascending order.
+//
+// PrusaSlicer brackets every layer with ";LAYER_CHANGE" followed by ";Z:<top>",
+// which is the only reliable place to cut: everything up to that marker is a
+// finished layer, so each segment is self-contained and the resumed stream picks
+// up exactly where it left off.  A layer whose top is at or below the cut belongs
+// to the lower segment; the first layer above it starts the next one.
+//
+// This is why the part is sliced whole rather than as two bodies — the extrusion
+// paths are identical to an uninterrupted print, and PrusaSlicer is never asked
+// to slice geometry floating above the bed.
+std::vector<std::vector<std::string>> Assembler::splitGcodeAtHeights(
+    const std::vector<std::string>& gcode,
+    std::vector<double>             heights)
+{
+    std::sort(heights.begin(), heights.end());
+
+    std::vector<std::vector<std::string>> segments;
+    segments.emplace_back();
+
+    size_t next_cut = 0;
+
+    for (size_t i = 0; i < gcode.size(); ++i)
+    {
+        if (next_cut < heights.size() && gcode[i] == ";LAYER_CHANGE")
+        {
+            // The layer's top height is on the following ";Z:" line.
+            double layer_z = -1.0;
+            for (size_t j = i + 1; j < gcode.size() && j < i + 4; ++j)
+            {
+                if (gcode[j].rfind(";Z:", 0) == 0)
+                {
+                    try { layer_z = std::stod(gcode[j].substr(3)); } catch (...) {}
+                    break;
+                }
+            }
+
+            // First layer sitting above the cut — start a new segment here.
+            if (layer_z > heights[next_cut] + 1e-9)
+            {
+                RCLCPP_INFO(logger(),
+                            "Print segment boundary at Z=%.2f mm (cut requested at %.2f mm)",
+                            layer_z, heights[next_cut]);
+                segments.emplace_back();
+                ++next_cut;
+            }
+        }
+
+        segments.back().push_back(gcode[i]);
+    }
+
+    if (next_cut < heights.size())
+        RCLCPP_WARN(logger(),
+                    "Only %zu of %zu print cuts found — the part may be shorter than "
+                    "the requested cut height", next_cut, heights.size());
+
+    return segments;
+}
+
 void Assembler::generateSlicerGcode()
 {
     RCLCPP_INFO(logger(), "Generating Slicer Gcode for internal parts");
@@ -739,6 +890,8 @@ void Assembler::generateSlicerGcode()
     for (auto const& [part, transform] : initial_assembly_->getUnassembledPartTransforms()) //No assembled parts in target assembly
     {
         if (part->getType() != Part::INTERNAL)
+            continue;
+        if (isSplitPiece(part))   // its geometry is already in the source STL
             continue;
 
         //Put the part in its correct position before exporting as STL
@@ -828,6 +981,16 @@ void Assembler::generateSlicerGcode()
             slicer_gcode_.pop_back();
         }
     }
+
+    // Divide the print wherever a part has to be dropped in mid-build.
+    std::vector<double> cuts;
+    for (auto const& sp : splits_) cuts.push_back(sp.z_cut_rel);
+
+    slicer_gcode_segments_ = splitGcodeAtHeights(slicer_gcode_, cuts);
+
+    if (slicer_gcode_segments_.size() > 1)
+        RCLCPP_INFO(logger(), "Print divided into %zu segments for %zu mid-print insertion(s)",
+                    slicer_gcode_segments_.size(), splits_.size());
 }
 
 std::vector<std::shared_ptr<AssemblyNode>> Assembler::depthFirstZAssembly()
@@ -887,6 +1050,11 @@ std::vector<std::shared_ptr<AssemblyNode>> Assembler::depthFirstZAssembly()
         }
 
         std::vector<std::shared_ptr<AssemblyNode>> neighbours = findNodeNeighbours(current_node);
+
+        // Splitting a printed part is a last resort: only once plain removal
+        // offers nowhere to go from this state.
+        if (neighbours.empty())
+            neighbours = findSplitNeighbours(current_node);
 
         // Precompute the distance of each neighbour's newly-unassembled part from the assembly center
         auto get_unassembled_distance = [&](const std::shared_ptr<AssemblyNode>& neighbour) -> double {
@@ -980,6 +1148,11 @@ std::vector<std::shared_ptr<AssemblyNode>> Assembler::breadthFirstZAssembly()
 
         std::vector<std::shared_ptr<AssemblyNode>> neighbours = findNodeNeighbours(current_node);
 
+        // Splitting a printed part is a last resort: only once plain removal
+        // offers nowhere to go from this state.
+        if (neighbours.empty())
+            neighbours = findSplitNeighbours(current_node);
+
         for (std::shared_ptr<AssemblyNode> neighbour : neighbours)
         {
             //If neighbour has already been visited, move on
@@ -1024,9 +1197,14 @@ std::vector<std::shared_ptr<AssemblyNode>> Assembler::breadthFirstZAssembly()
 //
 // Returns nullopt if infeasible; otherwise the grasp in local frame (mm) —
 // zero for non-external parts.
+// `blockers`, when non-null, is filled with every assembled part that obstructs
+// the upward lift.  The plain feasibility path stops at the first hit; only the
+// split search needs the full set, and it needs it to know which printed part is
+// worth cutting.
 std::optional<gp_Pnt> Assembler::edge_feasible(
     std::shared_ptr<Part> part,
-    const PartTransformMap& assembled)
+    const PartTransformMap& assembled,
+    std::vector<std::shared_ptr<Part>>* blockers)
 {
     if (part->getType() == Part::SCREW)  return gp_Pnt(0,0,0);
     if (part->isPushfit())               return gp_Pnt(0,0,0);
@@ -1044,11 +1222,15 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
         const double STEP_MM = 1.0;
         const int    N_STEPS = 5;
 
-        auto part_lf_shape = std::make_shared<TopoDS_Shape>(
-            LocalFrameShapeM(*part->getShape()));
+        // Built once per part and kept: rebuilding it per call churned shapes
+        // through the adapter's pointer-keyed geometry cache, and is wasted work.
+        auto& cached = lf_shape_cache_[part->getId()];
+        if (!cached)
+            cached = std::make_shared<TopoDS_Shape>(LocalFrameShapeM(*part->getShape()));
+        auto part_lf_shape = cached;
 
         bool z_ok = true;
-        for (int step = 1; step <= N_STEPS && z_ok; ++step)
+        for (int step = 1; step <= N_STEPS && (z_ok || blockers); ++step)
         {
             gp_Trsf lifted;
             lifted.SetTranslation(gp_Vec(
@@ -1065,7 +1247,11 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
                 if (!collision_adapter_->collision_free(part_id, other_id))
                 {
                     z_ok = false;
-                    break;
+                    if (!blockers) break;   // fast path: one hit is enough
+
+                    // Collecting: record every obstruction, not just the first.
+                    if (std::find(blockers->begin(), blockers->end(), other) == blockers->end())
+                        blockers->push_back(other);
                 }
             }
         }
@@ -1110,6 +1296,250 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
     const gp_Pnt grasp = *grasp_opt;
 
     return grasp;
+}
+
+namespace {
+
+// Count solid bodies in a boolean result.  A horizontal plane can divide a part
+// into more than two pieces (two towers cut below the fork gives one lower and
+// two upper), which the brief rules out, so this is how that is detected.
+int countSolids(const TopoDS_Shape& shape)
+{
+    int n = 0;
+    for (TopExp_Explorer e(shape, TopAbs_SOLID); e.More(); e.Next()) ++n;
+    return n;
+}
+
+// A box spanning `reference` in X/Y with generous margin, covering [z_lo, z_hi].
+TopoDS_Shape halfSpaceBox(const TopoDS_Shape& reference, double z_lo, double z_hi)
+{
+    Bnd_Box bb = ShapeBoundingBox(reference);
+    Standard_Real xmin, ymin, zmin, xmax, ymax, zmax;
+    bb.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+
+    const double m = 10.0;   // margin so the cut fully clears the part in X/Y
+    return BRepPrimAPI_MakeBox(
+        gp_Pnt(xmin - m, ymin - m, z_lo),
+        gp_Pnt(xmax + m, ymax + m, z_hi)).Shape();
+}
+
+}  // namespace
+
+// Split `shape` by the horizontal plane z = z_cut.  Returns false unless the cut
+// yields exactly one solid on each side with meaningful volume on both — that
+// enforces the two-piece rule and rejects planes that merely graze the part.
+static bool splitAtZ(const TopoDS_Shape& shape, double z_cut,
+                     TopoDS_Shape& lower, TopoDS_Shape& upper)
+{
+    Bnd_Box bb = ShapeBoundingBox(shape);
+    Standard_Real xmin, ymin, zmin, xmax, ymax, zmax;
+    bb.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+
+    const double pad = 10.0;
+    if (z_cut <= zmin + 1e-6 || z_cut >= zmax - 1e-6) return false;  // nothing to divide
+
+    try {
+        upper = SubtractShapeBFromA(shape, halfSpaceBox(shape, zmin - pad, z_cut));
+        lower = SubtractShapeBFromA(shape, halfSpaceBox(shape, z_cut, zmax + pad));
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+
+    if (upper.IsNull() || lower.IsNull())              return false;
+    if (countSolids(upper) != 1 || countSolids(lower) != 1) return false;
+
+    const double vu = ShapeVolume(upper), vl = ShapeVolume(lower);
+    if (vu < 1e-3 || vl < 1e-3) return false;
+
+    return true;
+}
+
+// Make a Part out of a cut piece and register it with the scene and collision
+// backend.  Pieces are added permanently rather than swapped in and out: the
+// collision scene is global to the search, but what a node actually collides
+// against is decided by its own assembled map, so extra geometry sitting in the
+// scene is inert until a node lists it.
+std::shared_ptr<Part> Assembler::registerSplitPiece(const TopoDS_Shape& shape,
+                                                    const std::string&  name)
+{
+    auto piece = std::make_shared<Part>(
+        std::make_shared<TopoDS_Shape>(shape), Part::INTERNAL, next_split_id_++, name);
+
+    piece->set_mesh_asset(Tessellator::tessellate(shape, MESH_DEFLECTION_MM));
+
+    const gp_Pnt c = ShapeCentroid(shape);
+    gp_Trsf pose;
+    pose.SetTranslation(gp_Vec(c.X() * 0.001, c.Y() * 0.001, c.Z() * 0.001));
+
+    const std::string id = piece->getName() + "_" + std::to_string(piece->getId());
+    scene_.add_object(id, piece->get_mesh_asset(),
+                      std::make_shared<TopoDS_Shape>(LocalFrameShapeM(shape)),
+                      SceneRole::Part, pose, true);
+    collision_adapter_->sync(scene_);
+
+    // Pieces must be resolvable by ID downstream (getPartById), and printed
+    // pieces need a slot on the print bed.  arrangeInternalParts() will give
+    // this a real position later; the centroid is a placeholder until then.
+    if (initial_assembly_)
+        initial_assembly_->setUnassembledPart(piece, c);
+
+    return piece;
+}
+
+// Advisory check on the first layer printed after the insertion.  Takes a thin
+// slab of the upper piece just above the cut and asks how much of it lands on
+// solid material (the lower piece or the part just placed).  Support is the
+// model designer's responsibility, so this only warns.
+void Assembler::warnIfUnsupported(const TopoDS_Shape& upper,
+                                  const TopoDS_Shape& lower,
+                                  const TopoDS_Shape& placed_part,
+                                  double z_cut,
+                                  const std::string& name) const
+{
+    constexpr double LAYER   = 0.4;   // mm, representative first-layer thickness
+    constexpr double WARN_AT = 0.30;  // warn once 30% of the layer is unsupported
+
+    try {
+        TopoDS_Shape slab = ShapeIntersection(upper, halfSpaceBox(upper, z_cut, z_cut + LAYER));
+        if (slab.IsNull()) return;
+        const double slab_vol = ShapeVolume(slab);
+        if (slab_vol < 1e-6) return;
+
+        // Material directly beneath the cut, lifted by one layer so an
+        // intersection with the slab measures the supported footprint.
+        TopoDS_Shape below = makeCompound({
+            ShapeIntersection(lower,       halfSpaceBox(lower,       z_cut - LAYER, z_cut)),
+            ShapeIntersection(placed_part, halfSpaceBox(placed_part, z_cut - LAYER, z_cut))});
+        below = TranslateShape(below, gp_Vec(0, 0, LAYER));
+
+        TopoDS_Shape supported = ShapeIntersection(slab, below);
+        const double supported_vol = supported.IsNull() ? 0.0 : ShapeVolume(supported);
+        const double unsupported   = 1.0 - std::min(1.0, supported_vol / slab_vol);
+
+        if (unsupported > WARN_AT)
+            RCLCPP_WARN(logger(),
+                        "Split of %s at z=%.2f leaves %.0f%% of the first printed layer "
+                        "unsupported — check the model has support there",
+                        name.c_str(), z_cut, unsupported * 100.0);
+    } catch (const Standard_Failure&) {
+        // Advisory only — a failed boolean here must not affect planning.
+    }
+}
+
+// Successors reachable only by cutting a printed part in two.
+//
+// Called only when ordinary removal has no successor at all, so the search never
+// cuts a part while a plain move exists.  For each external part that cannot be
+// lifted, the printed parts blocking it are candidates for the cut; the plane is
+// pinned to the top of the blocked part, which is the only height that works:
+// lower and the printhead would strike the part when resuming the print, higher
+// and the lower piece still encloses it so it could never have been inserted.
+//
+// Both phases are verified before either is committed, and emitted as one
+// transition — the cut has no purpose except to free that part.
+std::vector<std::shared_ptr<AssemblyNode>> Assembler::findSplitNeighbours(
+    std::shared_ptr<AssemblyNode> node)
+{
+    std::vector<std::shared_ptr<AssemblyNode>> neighbours;
+    if (splits_used_ >= max_splits_ || !collision_adapter_) return neighbours;
+
+    node->assembly_->setPartTransforms();
+    const auto& assembled = node->assembly_->getAssembledPartTransforms();
+
+    // ---- candidate (blocked part, printed blocker) pairs ----
+    struct Candidate {
+        std::shared_ptr<Part> blocked;   // P
+        std::shared_ptr<Part> printed;   // I
+        double                z_cut;
+    };
+    std::vector<Candidate> candidates;
+
+    for (auto const& [part, transform] : assembled)
+    {
+        if (part->getType() != Part::EXTERNAL) continue;
+
+        std::vector<std::shared_ptr<Part>> blockers;
+        if (edge_feasible(part, assembled, &blockers)) continue;   // not actually stuck
+
+        for (auto const& b : blockers)
+            if (b->getType() == Part::INTERNAL && b->getShape())
+                candidates.push_back({part, b, ShapeHighestPoint(*part->getShape())});
+    }
+
+    if (candidates.empty()) return neighbours;
+
+    // Cut as high as possible: the smaller the upper piece, the less has to be
+    // reprinted after the insertion.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b){ return a.z_cut > b.z_cut; });
+
+    for (auto const& cand : candidates)
+    {
+        TopoDS_Shape lower, upper;
+        if (!splitAtZ(*cand.printed->getShape(), cand.z_cut, lower, upper))
+            continue;   // >2 pieces, or the plane divides nothing
+
+        auto piece_lower = registerSplitPiece(
+            lower, cand.printed->getName() + "_lower");
+        auto piece_upper = registerSplitPiece(
+            upper, cand.printed->getName() + "_upper");
+
+        // State after phase 1's cut, before anything is removed.
+        PartTransformMap after_split;
+        for (auto const& [p, t] : assembled)
+            if (p->getId() != cand.printed->getId()) after_split[p] = t;
+        after_split[piece_lower] = ShapeCentroid(lower);
+        after_split[piece_upper] = ShapeCentroid(upper);
+
+        // Phase 1: the upper piece must come off.
+        if (!edge_feasible(piece_upper, after_split)) continue;
+
+        // Phase 2: with it gone, the blocked part must come off.
+        PartTransformMap after_upper = after_split;
+        after_upper.erase(piece_upper);
+        auto grasp = edge_feasible(cand.blocked, after_upper);
+        if (!grasp) continue;
+
+        warnIfUnsupported(upper, lower, *cand.blocked->getShape(),
+                          cand.z_cut, cand.printed->getName());
+
+        // ---- commit both phases as one transition ----
+        auto next_assembly = std::make_shared<Assembly>();
+        for (auto const& [p, t] : node->assembly_->getUnassembledPartTransforms())
+            next_assembly->setUnassembledPart(p, t);
+        for (auto const& [p, t] : after_upper)
+            if (p->getId() != cand.blocked->getId()) next_assembly->setAssembledPart(p, t);
+
+        next_assembly->setUnassembledPart(
+            piece_upper, initial_assembly_->getUnassembledPartTransforms().count(piece_upper)
+                             ? initial_assembly_->getUnassembledPartTransforms()[piece_upper]
+                             : ShapeCentroid(upper));
+        next_assembly->setUnassembledPart(
+            cand.blocked, initial_assembly_->getUnassembledPartTransforms()[cand.blocked]);
+
+        auto next = std::make_shared<AssemblyNode>();
+        next->assembly_      = next_assembly;
+        next->id_            = nodeIdGenerator(next_assembly->getAssembledPartIds());
+        next->edge_part_     = cand.blocked;
+        next->edge_grasp_    = *grasp;
+        next->is_split_step_ = true;
+        next->split_source_  = cand.printed;
+        next->split_lower_   = piece_lower;
+        next->split_upper_   = piece_upper;
+        next->split_z_       = cand.z_cut;
+        next->split_z_rel_   = cand.z_cut - ShapeLowestPoint(*cand.printed->getShape());
+
+        ++splits_used_;
+        RCLCPP_INFO(logger(),
+                    "Split %s at z=%.2f mm to free %s (split %d of %d allowed)",
+                    cand.printed->getName().c_str(), cand.z_cut,
+                    cand.blocked->getName().c_str(), splits_used_, max_splits_);
+
+        neighbours.push_back(next);
+        break;   // one split per dead end; the search can split again later
+    }
+
+    return neighbours;
 }
 
 std::vector<std::shared_ptr<AssemblyNode>> Assembler::findNodeNeighbours(std::shared_ptr<AssemblyNode> node)
@@ -1217,6 +1647,12 @@ void Assembler::generateInitialAssembly()
     {
         initial_assembly_->setUnassembledPart(part, transform);
     }
+
+    // Split pieces are created during the search, so their IDs must start above
+    // every ID already in use.
+    next_split_id_ = 0;
+    for (auto const& [part, _] : target_assembly_->getAssembledPartTransforms())
+        next_split_id_ = std::max(next_split_id_, part->getId() + 1);
 
     // Pre-assign bay positions for external parts so they are available during DFS.
     assignExternalBayPositions();
