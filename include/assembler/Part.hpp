@@ -36,9 +36,27 @@ public:
 
     void setVacuumGrasp(gp_Pnt grasp) { vacuum_grasp_position_ = grasp; }
 
+    // Which end effector this part is picked with.  Set by the planner once a
+    // grasp is found; the vacuum cup is preferred and the gripper is the fallback.
+    enum class GraspTool { NONE, VACUUM, PPG };
+
     void setPPGGrasp(PPGGrasp grasp) { ppg_grasp_ = grasp; }
+    void      setGraspTool(GraspTool t) { grasp_tool_ = t; }
+    GraspTool getGraspTool() const      { return grasp_tool_; }
 
     gp_Pnt                          getVacuumGrasp()        { return vacuum_grasp_position_; }
+
+    // Where the tool meets the part, relative to its centroid, whichever tool is
+    // in use.  Pick and place positions derive from this, so reading the vacuum
+    // offset unconditionally would place a gripper pick at the part centroid.
+    gp_Pnt                          getGraspOffset()
+    {
+        if (grasp_tool_ == GraspTool::PPG)
+            return gp_Pnt(ppg_grasp_.position_.X(),
+                          ppg_grasp_.position_.Y(),
+                          ppg_grasp_.position_.Z());
+        return vacuum_grasp_position_;
+    }
     PPGGrasp                        getPPGGrasp()           { return ppg_grasp_; }
 
     void                            set_mesh_asset(std::shared_ptr<MeshAsset> m) { mesh_asset_ = m; }
@@ -71,7 +89,8 @@ private:
 
     gp_Pnt vacuum_grasp_position_;  //Relative to CoM
 
-    PPGGrasp ppg_grasp_;
+    PPGGrasp  ppg_grasp_;
+    GraspTool grasp_tool_ = GraspTool::NONE;
 
     size_t id_;
 

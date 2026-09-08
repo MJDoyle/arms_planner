@@ -6,6 +6,7 @@
 #include "assembler/CollisionAdapter.hpp"
 #include "assembler/MeshAsset.hpp"
 #include "assembler/VacuumGraspGenerator.hpp"
+#include "assembler/PPGGraspGenerator.hpp"
 
 #include <string>
 #include <memory>
@@ -29,6 +30,20 @@ struct ToolConfig {
     double offset_x_mm = 0.0;
     double offset_y_mm = 0.0;
     double offset_z_mm = 0.0;
+};
+
+// Parallel-plate gripper, used when the vacuum cup cannot seal.  The jaws close
+// along a horizontal axis and the whole tool rotates about z, so a grasp is
+// (position, angle, opening) — see PPGGraspGenerator.
+struct GripperConfig {
+    double jaw_width_mm     = 10.0;  // along the jaw face, horizontal
+    double jaw_height_mm    = 12.0;  // along the jaw face, vertical
+    double jaw_thickness_mm =  4.0;  // through the jaw
+    double min_opening_mm   =  2.0;
+    double max_opening_mm   = 60.0;
+    double friction_mu      =  0.5;  // jaw pad against part; sets the max face slope
+    // Extra clearance cut either side of the jaws when slotting a jig.
+    double slot_clearance_mm = 1.0;
 };
 
 class Assembler {
@@ -67,7 +82,27 @@ public:
 
     // 0 disables splitting entirely.
     void setMaxSplits(int v) { max_splits_ = v; }
+
+    // Stream the search as it runs, as one JSON object per line prefixed "[dfs] ".
+    // Off by default: collecting the rejection reasons costs extra collision
+    // queries, and it is only wanted when someone is watching.
+    void setTraceDfs(bool v) { trace_dfs_ = v; }
+
+    // A grasp edited by hand in the viewer, replacing whatever the planner would
+    // have chosen for that part.  Offsets are in the part's own frame, which is
+    // why one value covers both the pick and the place.
+    struct GraspOverride {
+        std::string tool;        // "vacuum" | "gripper"
+        double dx_mm = 0.0, dy_mm = 0.0, dz_mm = 0.0;
+        double width_mm = 0.0;   // gripper only; 0 keeps the planner's opening
+        // Zero is a valid jaw angle, so presence is tracked separately.
+        double angle_rad = 0.0;
+        bool   has_angle = false;
+    };
+    void setGraspOverrides(const std::map<size_t, GraspOverride>& o) { grasp_overrides_ = o; }
     void setToolConfig(const ToolConfig& cfg) { tool_config_ = cfg; }
+    void setGripperConfig(const GripperConfig& cfg) { gripper_config_ = cfg; }
+    const GripperConfig& gripperConfig() const { return gripper_config_; }
 
     void reset();  // Clear all run-specific state so a new model can be loaded cleanly
 
@@ -133,6 +168,10 @@ private:
     // alignAssemblyPathToInitialAssembly() has moved the assembly.
     void refreshCollisionScene();
 
+    void applyGraspOverride(const std::shared_ptr<Part>& part,
+                            const GraspOverride& ov,
+                            const std::vector<std::string>& assembled_ids);
+
     // Check whether removing `part` from `assembled` is physically feasible.
     // Returns nullopt if infeasible; otherwise the grasp position in local frame
     // (relative to part centroid, mm) — zero for parts without a grasp (internal).
@@ -149,6 +188,10 @@ private:
     // feasibility checks and later DFS nodes can see it.
     std::shared_ptr<Part> registerSplitPiece(const TopoDS_Shape& shape,
                                              const std::string&  name);
+
+    // Undo registerSplitPiece for a candidate that did not work out.  Without
+    // this the scene keeps every piece the search ever speculatively cut.
+    void unregisterSplitPiece(const std::shared_ptr<Part>& piece);
 
     // Warn when a cut leaves a large unsupported first layer.  Advisory only:
     // support is the model designer's call, this just flags it.
@@ -181,6 +224,10 @@ private:
     // Geometry-only grasp candidates per external part (by Part ID), built
     // once by precomputeGraspCandidates() before the DFS starts.
     std::map<size_t, PartGraspCandidates> grasp_candidates_;
+
+    // Parallel-plate candidates, same lifecycle as the vacuum ones: geometry-only,
+    // computed once per external part before the search.
+    std::map<size_t, PartPPGCandidates> ppg_candidates_;
 
     // Every grasp attempt behind the selected grasps, recorded by the single
     // authoritative pass in generateGrasps().  debugGrasps() just hands this to
@@ -229,6 +276,11 @@ private:
     };
     std::vector<SplitRecord> splits_;
 
+    // Hand edits, applied in generateGrasps() so the command file and g-code
+    // carry them.  The sequence itself is left alone: the user changed how a part
+    // is picked, not the order it goes in.
+    std::map<size_t, GraspOverride> grasp_overrides_;
+
     // Local-frame collision shape per part ID, built on first use and kept alive
     // for the run.  Also keeps the adapter's geometry cache keys stable.
     std::map<size_t, std::shared_ptr<TopoDS_Shape>> lf_shape_cache_;
@@ -245,10 +297,17 @@ private:
         return false;
     }
 
+    bool   trace_dfs_    = false;
+    void   traceDfs(const std::string& json) const;
+
     int    max_splits_   = 2;
     int    splits_used_  = 0;
+    // Cutting is tried at every dead end and each attempt costs boolean geometry,
+    // so the work is capped as well as the number of cuts actually taken.
+    int    split_attempts_ = 0;
     size_t next_split_id_ = 0;
-    ToolConfig tool_config_;
+    ToolConfig    tool_config_;
+    GripperConfig gripper_config_;
     std::string run_output_dir_;
     std::string slicer_config_dir_;
 

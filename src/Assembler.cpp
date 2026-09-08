@@ -54,6 +54,40 @@ Assembler::Assembler()
     initialisePartBays();
 }
 
+// One search event, as a JSON object on its own line.  It rides the normal
+// stdout stream the viewer already reads, so no extra channel is needed.
+void Assembler::traceDfs(const std::string& json) const
+{
+    if (!trace_dfs_) return;
+    std::printf("[dfs] %s\n", json.c_str());
+    std::fflush(stdout);
+}
+
+// Minimal JSON string escaping — part names carry quotes and backslashes.
+static std::string jesc(const std::string& in)
+{
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (char c : in) {
+        if (c == '"' || c == '\\') { out += '\\'; out += c; }
+        else if (c == '\n' || c == '\r' || c == '\t') out += ' ';
+        else out += c;
+    }
+    return out;
+}
+
+static std::string idListJson(const PartTransformMap& parts)
+{
+    std::string s = "[";
+    bool first = true;
+    for (auto const& [p, _] : parts) {
+        if (!first) s += ",";
+        s += std::to_string(p->getId());
+        first = false;
+    }
+    return s + "]";
+}
+
 void Assembler::reset()
 {
     target_assembly_.reset();
@@ -74,6 +108,7 @@ void Assembler::reset()
     nozzle_mesh_.reset();
     nozzle_shape_.reset();
     splits_used_ = 0;
+    split_attempts_ = 0;
 
     initialisePartBays();
 }
@@ -410,9 +445,9 @@ void Assembler::generateCommandFile(std::vector<size_t> part_addition_order)
         if (part->getType() != Part::INTERNAL)
             continue;   
 
-        gp_Vec pick_position = SumPoints(initial_transform, part->getVacuumGrasp());
+        gp_Vec pick_position = SumPoints(initial_transform, part->getGraspOffset());
 
-        gp_Vec place_position = SumPoints(target_assembly_->getAssembledPartTransforms()[part], part->getVacuumGrasp());
+        gp_Vec place_position = SumPoints(target_assembly_->getAssembledPartTransforms()[part], part->getGraspOffset());
 
         PPGGrasp ppg_grasp = part->getPPGGrasp();
 
@@ -443,8 +478,15 @@ void Assembler::generateCommandFile(std::vector<size_t> part_addition_order)
         designate_part_command["command-properties"]["part-grasp-height"] = grasp_position.Z();
         designate_part_command["command-properties"]["part-grasp-pos-x"] = grasp_position.X();
         designate_part_command["command-properties"]["part-grasp-pos-y"] = grasp_position.Y();
-        designate_part_command["command-properties"]["part-grasp-angle"] = ppg_grasp.rotation_;
-        designate_part_command["command-properties"]["part-grasp-width"] = ppg_grasp.width_;
+        // Which end effector this part is picked with, so the machine knows
+        // whether the angle/width fields below are meaningful.
+        const char* tool_name = "none";
+        switch (part->getGraspTool()) {
+            case Part::GraspTool::VACUUM: tool_name = "vacuum";  break;
+            case Part::GraspTool::PPG:    tool_name = "gripper"; break;
+            case Part::GraspTool::NONE:   tool_name = "none";    break;
+        }
+        designate_part_command["command-properties"]["grasp-tool"] = std::string(tool_name);
 
         commands.push_back(designate_part_command);
     }
@@ -455,9 +497,9 @@ void Assembler::generateCommandFile(std::vector<size_t> part_addition_order)
         if (part->getType() != Part::EXTERNAL)
             continue;
 
-        gp_Vec pick_position = SumPoints(initial_transform, part->getVacuumGrasp());
+        gp_Vec pick_position = SumPoints(initial_transform, part->getGraspOffset());
 
-        gp_Vec place_position = SumPoints(target_assembly_->getAssembledPartTransforms()[part], part->getVacuumGrasp());
+        gp_Vec place_position = SumPoints(target_assembly_->getAssembledPartTransforms()[part], part->getGraspOffset());
 
         const gp_Pnt assembled_pos_ext = target_assembly_->getAssembledPartTransforms()[part];
 
@@ -477,9 +519,30 @@ void Assembler::generateCommandFile(std::vector<size_t> part_addition_order)
         designate_part_command["command-properties"]["part-pick-pos-y"] = pick_position.Y();
         designate_part_command["command-properties"]["part-place-pos-x"] = place_position.X();
         designate_part_command["command-properties"]["part-place-pos-y"] = place_position.Y();
-        designate_part_command["command-properties"]["grasp-pos-x"] = part->getVacuumGrasp().X();
-        designate_part_command["command-properties"]["grasp-pos-y"] = part->getVacuumGrasp().Y();
-        designate_part_command["command-properties"]["grasp-pos-z"] = part->getVacuumGrasp().Z();
+        // Reported for whichever tool is in use, matching the pick/place above.
+        designate_part_command["command-properties"]["grasp-pos-x"] = part->getGraspOffset().X();
+        designate_part_command["command-properties"]["grasp-pos-y"] = part->getGraspOffset().Y();
+        designate_part_command["command-properties"]["grasp-pos-z"] = part->getGraspOffset().Z();
+
+        // Which end effector picks this part, and — for the gripper — the jaw
+        // pose.  The angle/width fields are emitted only when they mean something;
+        // they were previously written for every part from an uninitialised
+        // PPGGrasp, which produced convincing-looking but meaningless numbers.
+        const char* ext_tool = "none";
+        switch (part->getGraspTool()) {
+            case Part::GraspTool::VACUUM: ext_tool = "vacuum";  break;
+            case Part::GraspTool::PPG:    ext_tool = "gripper"; break;
+            case Part::GraspTool::NONE:   ext_tool = "none";    break;
+        }
+        designate_part_command["command-properties"]["grasp-tool"] = std::string(ext_tool);
+
+        if (part->getGraspTool() == Part::GraspTool::PPG)
+        {
+            const PPGGrasp& g = part->getPPGGrasp();
+            designate_part_command["command-properties"]["part-grasp-angle"] = g.rotation_;
+            designate_part_command["command-properties"]["part-grasp-width"] = g.width_;
+            designate_part_command["command-properties"]["part-grasp-jaw-z"] = g.jaw_z_;
+        }
 
         commands.push_back(designate_part_command);
     }
@@ -997,6 +1060,19 @@ std::vector<std::shared_ptr<AssemblyNode>> Assembler::depthFirstZAssembly()
 {
     RCLCPP_INFO(logger(), "Generating assembly path (DFS)");
 
+    {
+        std::string legend = "{\"ev\":\"parts\",\"map\":{";
+        bool first = true;
+        for (auto const& [p, _] : target_assembly_->getAssembledPartTransforms()) {
+            if (!first) legend += ",";
+            legend += "\"" + std::to_string(p->getId()) + "\":{\"name\":\"" +
+                      jesc(p->getName()) + "\",\"type\":" +
+                      std::to_string(static_cast<int>(p->getType())) + "}";
+            first = false;
+        }
+        traceDfs(legend + "}}");
+    }
+
     std::vector<std::shared_ptr<AssemblyNode>> path;
 
     std::shared_ptr<AssemblyNode> target_node;
@@ -1042,9 +1118,13 @@ std::vector<std::shared_ptr<AssemblyNode>> Assembler::depthFirstZAssembly()
             RCLCPP_INFO(logger(), "Name %s, ID %ld, type %d", part_position.first->getName().c_str(), part_position.first->getId(), part_position.first->getType());
         }
 
+        traceDfs("{\"ev\":\"visit\",\"id\":" + std::to_string(current_node->id_) +
+                 ",\"parts\":" + idListJson(current_node->assembly_->getAssembledPartTransforms()) + "}");
+
         // Target condition: no assembled parts remaining
         if (current_node->assembly_->getAssembledPartTransforms().empty())
         {
+            traceDfs("{\"ev\":\"goal\",\"id\":" + std::to_string(current_node->id_) + "}");
             target_node = current_node;
             break; // DFS typically stops when first target found
         }
@@ -1055,6 +1135,9 @@ std::vector<std::shared_ptr<AssemblyNode>> Assembler::depthFirstZAssembly()
         // offers nowhere to go from this state.
         if (neighbours.empty())
             neighbours = findSplitNeighbours(current_node);
+
+        if (neighbours.empty())
+            traceDfs("{\"ev\":\"dead\",\"id\":" + std::to_string(current_node->id_) + "}");
 
         // Precompute the distance of each neighbour's newly-unassembled part from the assembly center
         auto get_unassembled_distance = [&](const std::shared_ptr<AssemblyNode>& neighbour) -> double {
@@ -1292,7 +1375,20 @@ std::optional<gp_Pnt> Assembler::edge_feasible(
     auto grasp_opt = VacuumGraspGenerator::select(
         part, candidates_it->second, *collision_adapter_, nozzle_shape_, assembled_ids);
 
-    if (!grasp_opt) return std::nullopt;
+    if (!grasp_opt)
+    {
+        // No seal available here — try the parallel-plate gripper instead.  A
+        // gripper grasp is reported as a zero vacuum offset because the two are
+        // parameterised differently; the tool actually used is recorded on the
+        // part by generateGrasps().
+        auto ppg_it = ppg_candidates_.find(part->getId());
+        if (ppg_it != ppg_candidates_.end() &&
+            PPGGraspGenerator::select(part, ppg_it->second, gripper_config_,
+                                      *collision_adapter_, assembled_ids))
+            return gp_Pnt(0, 0, 0);
+
+        return std::nullopt;
+    }
     const gp_Pnt grasp = *grasp_opt;
 
     return grasp;
@@ -1375,7 +1471,6 @@ std::shared_ptr<Part> Assembler::registerSplitPiece(const TopoDS_Shape& shape,
     scene_.add_object(id, piece->get_mesh_asset(),
                       std::make_shared<TopoDS_Shape>(LocalFrameShapeM(shape)),
                       SceneRole::Part, pose, true);
-    collision_adapter_->sync(scene_);
 
     // Pieces must be resolvable by ID downstream (getPartById), and printed
     // pieces need a slot on the print bed.  arrangeInternalParts() will give
@@ -1384,6 +1479,14 @@ std::shared_ptr<Part> Assembler::registerSplitPiece(const TopoDS_Shape& shape,
         initial_assembly_->setUnassembledPart(piece, c);
 
     return piece;
+}
+
+void Assembler::unregisterSplitPiece(const std::shared_ptr<Part>& piece)
+{
+    if (!piece) return;
+    scene_.remove_object(piece->getName() + "_" + std::to_string(piece->getId()));
+    if (initial_assembly_) initial_assembly_->removeUnassembledPart(piece);
+    lf_shape_cache_.erase(piece->getId());
 }
 
 // Advisory check on the first layer printed after the insertion.  Takes a thin
@@ -1443,6 +1546,11 @@ std::vector<std::shared_ptr<AssemblyNode>> Assembler::findSplitNeighbours(
     std::vector<std::shared_ptr<AssemblyNode>> neighbours;
     if (splits_used_ >= max_splits_ || !collision_adapter_) return neighbours;
 
+    // A search that dead-ends thousands of times would otherwise re-attempt this
+    // at every one of them, and each attempt is several boolean operations.
+    const int attempt_budget = std::max(10, 50 * max_splits_);
+    if (split_attempts_ >= attempt_budget) return neighbours;
+
     node->assembly_->setPartTransforms();
     const auto& assembled = node->assembly_->getAssembledPartTransforms();
 
@@ -1479,10 +1587,28 @@ std::vector<std::shared_ptr<AssemblyNode>> Assembler::findSplitNeighbours(
         if (!splitAtZ(*cand.printed->getShape(), cand.z_cut, lower, upper))
             continue;   // >2 pieces, or the plane divides nothing
 
+        ++split_attempts_;
+        if (split_attempts_ >= attempt_budget) {
+            RCLCPP_INFO(logger(), "Split attempt budget (%d) reached — no more cutting",
+                        attempt_budget);
+            break;
+        }
+
         auto piece_lower = registerSplitPiece(
             lower, cand.printed->getName() + "_lower");
         auto piece_upper = registerSplitPiece(
             upper, cand.printed->getName() + "_upper");
+        collision_adapter_->sync(scene_);
+
+        // Pieces are registered before they can be tested, so a rejected
+        // candidate has to put the scene back — otherwise every speculative cut
+        // the search ever makes stays in it, and both memory and sync cost grow
+        // without bound over a long run.
+        auto discard = [&] {
+            unregisterSplitPiece(piece_lower);
+            unregisterSplitPiece(piece_upper);
+            collision_adapter_->sync(scene_);
+        };
 
         // State after phase 1's cut, before anything is removed.
         PartTransformMap after_split;
@@ -1492,13 +1618,13 @@ std::vector<std::shared_ptr<AssemblyNode>> Assembler::findSplitNeighbours(
         after_split[piece_upper] = ShapeCentroid(upper);
 
         // Phase 1: the upper piece must come off.
-        if (!edge_feasible(piece_upper, after_split)) continue;
+        if (!edge_feasible(piece_upper, after_split)) { discard(); continue; }
 
         // Phase 2: with it gone, the blocked part must come off.
         PartTransformMap after_upper = after_split;
         after_upper.erase(piece_upper);
         auto grasp = edge_feasible(cand.blocked, after_upper);
-        if (!grasp) continue;
+        if (!grasp) { discard(); continue; }
 
         warnIfUnsupported(upper, lower, *cand.blocked->getShape(),
                           cand.z_cut, cand.printed->getName());
@@ -1560,11 +1686,34 @@ std::vector<std::shared_ptr<AssemblyNode>> Assembler::findNodeNeighbours(std::sh
     for (auto const& [part, transform] : assembled)
     {
         if (part->getType() == Part::INTERNAL && has_external)
+        {
+            traceDfs("{\"ev\":\"reject\",\"from\":" + std::to_string(node->id_) +
+                     ",\"part\":" + std::to_string(part->getId()) +
+                     ",\"why\":\"printed part must come out last\"}");
             continue;
+        }
 
-        auto grasp_result = edge_feasible(part, assembled);
+        // When tracing, ask which parts obstruct the lift so a stuck part can be
+        // explained rather than just reported as infeasible.
+        std::vector<std::shared_ptr<Part>> blockers;
+        auto grasp_result = edge_feasible(part, assembled,
+                                          trace_dfs_ ? &blockers : nullptr);
         if (!grasp_result)
+        {
+            std::string why, by = "[";
+            if (!blockers.empty()) {
+                why = "obstructed";
+                for (size_t i = 0; i < blockers.size(); ++i)
+                    by += (i ? "," : "") + std::to_string(blockers[i]->getId());
+            } else {
+                why = "no grasp found";
+            }
+            by += "]";
+            traceDfs("{\"ev\":\"reject\",\"from\":" + std::to_string(node->id_) +
+                     ",\"part\":" + std::to_string(part->getId()) +
+                     ",\"why\":\"" + why + "\",\"by\":" + by + "}");
             continue;
+        }
 
         //Create new assembly node
         std::shared_ptr<Assembly> neighbour_assembly = std::shared_ptr<Assembly>(new Assembly());
@@ -1588,6 +1737,11 @@ std::vector<std::shared_ptr<AssemblyNode>> Assembler::findNodeNeighbours(std::sh
         // Store the part placed (and its grasp) to reach this neighbour from the current node.
         neighbour_node->edge_part_  = part;
         neighbour_node->edge_grasp_ = *grasp_result;
+
+        traceDfs("{\"ev\":\"edge\",\"from\":" + std::to_string(node->id_) +
+                 ",\"to\":" + std::to_string(neighbour_node->id_) +
+                 ",\"part\":" + std::to_string(part->getId()) +
+                 ",\"parts\":" + idListJson(neighbour_assembly->getAssembledPartTransforms()) + "}");
 
         neighbours.push_back(neighbour_node);
     }
@@ -1777,6 +1931,7 @@ void Assembler::generateInitialAssembly()
 void Assembler::precomputeGraspCandidates()
 {
     grasp_candidates_.clear();
+    ppg_candidates_.clear();
     if (!generate_grasps_ || !nozzle_shape_ || !make_collision_adapter_) return;
 
     struct Job {
@@ -1831,8 +1986,14 @@ void Assembler::precomputeGraspCandidates()
             PartGraspCandidates candidates = VacuumGraspGenerator::precompute(
                 job.part, job.world_pos_mm, job.local_frame_shape, *adapter, nozzle_shape_);
 
+            // Parallel-plate candidates for the same part.  Pure geometry — no
+            // adapter involved — so it rides along on the same worker.
+            PartPPGCandidates ppg =
+                PPGGraspGenerator::precompute(job.part, gripper_config_);
+
             std::lock_guard<std::mutex> lock(results_mutex);
             grasp_candidates_[job.part->getId()] = std::move(candidates);
+            ppg_candidates_[job.part->getId()]   = std::move(ppg);
         }
     };
 
@@ -1855,8 +2016,9 @@ void Assembler::precomputeGraspCandidates()
         size_t total = 0;
         for (auto const& f : faces) total += f.size();
         RCLCPP_INFO(logger(),
-                    "  %-40s %zu candidate(s) on %zu face(s)",
-                    job.part->getName().c_str(), total, faces.size());
+                    "  %-40s vacuum: %zu candidate(s) on %zu face(s), gripper: %zu",
+                    job.part->getName().c_str(), total, faces.size(),
+                    ppg_candidates_[job.part->getId()].candidates.size());
     }
 }
 
@@ -1898,6 +2060,42 @@ void Assembler::generateNegatives()
         part->setCentroidPosition(gp_Pnt(transform.X(), transform.Y(), JIG_CENTER_Z));
 
         CradleGenerator cradle_gen(part->getName(), *part->getShape(), cradle_scaling_distance_);
+
+        // A part picked with the gripper needs channels through the cradle wall
+        // for its fingers.  The grasp is stored relative to the part centroid, so
+        // it re-registers onto the part wherever generateNegatives() has just put
+        // it.  Slots are cut with clearance and swept up past the jig top, so the
+        // jaws can descend into them from above.
+        if (part->getGraspTool() == Part::GraspTool::PPG)
+        {
+            const PPGGrasp& g = part->getPPGGrasp();
+            const gp_Pnt c = ShapeCentroid(*part->getShape());
+
+            PPGCandidate cand;
+            cand.angle_rad = g.rotation_;
+            cand.width_mm  = g.width_;
+            cand.jaw_z_mm  = c.Z() + g.jaw_z_;
+            cand.centre    = gp_Pnt(c.X() + g.position_.X(),
+                                    c.Y() + g.position_.Y(),
+                                    c.Z() + g.position_.Z());
+
+            GripperConfig slot_cfg = gripper_config_;
+            slot_cfg.jaw_width_mm     += 2.0 * slot_cfg.slot_clearance_mm;
+            slot_cfg.jaw_thickness_mm += 2.0 * slot_cfg.slot_clearance_mm;
+
+            const double sweep_top = c.Z() + JIG_HEIGHT + 20.0;
+
+            std::vector<TopoDS_Shape> slots;
+            for (int side : {+1, -1})
+                slots.push_back(PPGGraspGenerator::jawSolid(cand, slot_cfg, side, sweep_top));
+            cradle_gen.setFingerSlots(slots);
+
+            RCLCPP_INFO(logger(), "Jig for %s slotted for gripper at %.1f deg, opening %.2f mm",
+                        part->getName().c_str(), g.rotation_ * 180.0 / M_PI, g.width_);
+        }
+
+        RCLCPP_INFO(logger(), "Cradle for %s with %.2f mm hull clearance",
+                    part->getName().c_str(), cradle_scaling_distance_);
 
         float part_jig_z_offset = cradle_gen.createSimpleNegative(BAY_SIZES[part->getBaySizeIndex()], part->getBayIndex(), run_output_dir_);
 
@@ -2002,6 +2200,58 @@ Assembler::graspEvaluationContexts() const
     return contexts;
 }
 
+// Install a hand-edited grasp on a part, filling in whatever the override does
+// not carry (jaw angle and height) from the planner's own best candidate, and
+// reporting whether the result still passes the usual checks.
+void Assembler::applyGraspOverride(const std::shared_ptr<Part>& part,
+                                   const GraspOverride& ov,
+                                   const std::vector<std::string>& assembled_ids)
+{
+    if (ov.tool == "gripper")
+    {
+        PPGGrasp g;
+        g.position_ = gp_Vec(ov.dx_mm, ov.dy_mm, ov.dz_mm);
+        g.valid_    = true;
+
+        // Angle and jaw height are not part of the edit, so take them from the
+        // best candidate the planner found; failing that, a neutral pose.
+        auto it = ppg_candidates_.find(part->getId());
+        if (it != ppg_candidates_.end() && !it->second.candidates.empty())
+        {
+            const auto& best = it->second.candidates.front();
+            const gp_Pnt c = ShapeCentroid(*part->getShape());
+            g.rotation_ = best.angle_rad;
+            g.jaw_z_    = best.jaw_z_mm - c.Z();
+            g.width_    = best.width_mm;
+        }
+        else
+        {
+            g.rotation_ = 0.0;
+            g.jaw_z_    = ov.dz_mm - 0.5 * gripper_config_.jaw_height_mm;
+            g.width_    = gripper_config_.max_opening_mm * 0.5;
+        }
+        if (ov.width_mm > 0.0) g.width_ = ov.width_mm;
+        if (ov.has_angle)      g.rotation_ = ov.angle_rad;
+
+        part->setPPGGrasp(g);
+        part->setGraspTool(Part::GraspTool::PPG);
+        RCLCPP_INFO(logger(),
+                    "generateGrasps: %s uses a manual gripper grasp "
+                    "(%.2f, %.2f, %.2f) mm, opening %.2f mm, angle %.1f deg",
+                    part->getName().c_str(), ov.dx_mm, ov.dy_mm, ov.dz_mm, g.width_,
+                    g.rotation_ * 180.0 / M_PI);
+    }
+    else
+    {
+        part->setVacuumGrasp(gp_Pnt(ov.dx_mm, ov.dy_mm, ov.dz_mm));
+        part->setGraspTool(Part::GraspTool::VACUUM);
+        RCLCPP_INFO(logger(),
+                    "generateGrasps: %s uses a manual vacuum grasp (%.2f, %.2f, %.2f) mm",
+                    part->getName().c_str(), ov.dx_mm, ov.dy_mm, ov.dz_mm);
+    }
+    (void)assembled_ids;
+}
+
 void Assembler::generateGrasps()
 {
     if (!collision_adapter_ || !nozzle_shape_) return;
@@ -2015,6 +2265,16 @@ void Assembler::generateGrasps()
     for (auto const& [part, assembled_ids] : graspEvaluationContexts())
     {
         // (cancellation hook — currently a no-op; add std::atomic<bool>* flag if needed)
+
+        // A hand-edited grasp replaces synthesis outright.  It is still checked,
+        // so a warning goes out if the user has moved it somewhere the planner
+        // would have rejected — but their choice is what gets emitted.
+        auto ov = grasp_overrides_.find(part->getId());
+        if (ov != grasp_overrides_.end())
+        {
+            applyGraspOverride(part, ov->second, assembled_ids);
+            continue;
+        }
 
         auto it = grasp_candidates_.find(part->getId());
         if (it == grasp_candidates_.end())
@@ -2033,11 +2293,32 @@ void Assembler::generateGrasps()
             assembled_ids, &grasp_attempts_);
 
         if (grasp)
+        {
             part->setVacuumGrasp(*grasp);
+            part->setGraspTool(Part::GraspTool::VACUUM);
+            continue;
+        }
+
+        // Vacuum cannot seal here — fall back to the parallel-plate gripper.
+        auto ppg_it = ppg_candidates_.find(part->getId());
+        std::optional<PPGGrasp> ppg;
+        if (ppg_it != ppg_candidates_.end())
+            ppg = PPGGraspGenerator::select(part, ppg_it->second, gripper_config_,
+                                            *collision_adapter_, assembled_ids);
+
+        if (ppg)
+        {
+            part->setPPGGrasp(*ppg);
+            part->setGraspTool(Part::GraspTool::PPG);
+        }
         else
+        {
+            part->setGraspTool(Part::GraspTool::NONE);
             RCLCPP_WARN(logger(),
-                        "generateGrasps: no grasp found for %s (against %zu part(s) in place)",
+                        "generateGrasps: no grasp found for %s with either tool "
+                        "(against %zu part(s) in place)",
                         part->getName().c_str(), assembled_ids.size());
+        }
     }
 }
 

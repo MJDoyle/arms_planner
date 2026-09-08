@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import zipfile
 from dataclasses import dataclass, field
@@ -46,6 +47,88 @@ class GraspRecord:
     # picked (closest to the centre of mass).  False on the other accepted
     # candidates, which were viable but not selected.  Absent in older files.
     chosen: bool = False
+
+
+@dataclass
+class PPGGraspRecord:
+    """Where the two gripper jaws sit for a part picked with the parallel plates.
+
+    Positions are world mm at the part's assembled pose, matching GraspRecord, so
+    the viewer can re-anchor them to wherever the part currently is.
+    """
+    part_id: int
+    x_mm: float                 # grasp centre, midway between the jaws
+    y_mm: float
+    z_mm: float
+    jaw_bottom_z_mm: float      # underside of the jaws
+    angle_rad: float            # jaw axis about +z
+    width_mm: float             # opening between the jaw faces
+    jaw_width_mm: float
+    jaw_height_mm: float
+    jaw_thickness_mm: float
+
+
+@dataclass
+class ToolArm:
+    """One arm of a gripper's jaw linkage.
+
+    It hinges on the chassis at (pivot_x, pivot_z) in the tool's own frame and
+    carries a jaw at `length_mm` away, so swinging it moves the jaw along a
+    circle — inward and upward together.
+    """
+    file: str
+    sign: int              # -1 or +1: which jaw it drives
+    pivot_x_mm: float
+    pivot_z_mm: float
+    length_mm: float
+
+
+@dataclass
+class ToolModel:
+    """A baked model of one end effector.
+
+    Re-based on the centre of its lowest geometry, so the origin is the point the
+    planner's grasp coordinates refer to — the cup's tip, or the underside of the
+    gripper's jaw carrier.  A gripper also ships its two jaws separately so they
+    can be drawn at the opening the plan calls for rather than as modelled.
+    """
+    body_file: str
+    origin_dz_mm: float = 0.0        # drop applied when placing at a grasp point
+    jaw_lo_file: str = ""
+    jaw_hi_file: str = ""
+    jaw_lo_inner_mm: float = 0.0     # centreline to gripping face, as modelled
+    jaw_hi_inner_mm: float = 0.0
+    jaw_bottom_dz_mm: float = 0.0    # jaw underside above the tool origin
+    arms: list = field(default_factory=list)
+    arm_length_mm: float = 0.0
+
+    @property
+    def has_linkage(self) -> bool:
+        return bool(self.arms) and self.arm_length_mm > 0.0
+
+    @property
+    def has_jaws(self) -> bool:
+        return bool(self.jaw_lo_file and self.jaw_hi_file)
+
+
+@dataclass
+class GraspOverride:
+    """A user edit to a part's grasp, layered over what the planner computed.
+
+    The offset is in the part's own frame — relative to its centroid — which is
+    why one value serves both the pick and the place: they are the same grasp
+    applied at two different part poses.
+    """
+    part_id: int
+    tool: str                   # "vacuum" | "gripper"
+    dx_mm: float = 0.0
+    dy_mm: float = 0.0
+    dz_mm: float = 0.0
+    # Jaw opening for a gripper pick.  Zero means "unset" — the planner's own
+    # opening still applies.
+    width_mm: float = 0.0
+    # Jaw axis about +z.  None means "unset", since zero is a valid angle.
+    angle_rad: Optional[float] = None
 
 
 @dataclass
@@ -151,6 +234,15 @@ class SceneDocument:
     # contact face at z = -0.01 m.  Empty for files written before it was baked in.
     nozzle_file: str = ""
 
+    # Jaw poses for parts picked with the parallel-plate gripper.
+    ppg_grasps: list[PPGGraspRecord] = field(default_factory=list)
+
+    # Manual edits made in the viewer, applied on top of the planner's grasps.
+    grasp_overrides: list[GraspOverride] = field(default_factory=list)
+
+    # Baked end-effector models, keyed "vacuum" / "gripper".
+    tools: dict = field(default_factory=dict)
+
     # Set when loaded from a file; None if constructed programmatically.
     arms_path: Optional[str] = field(default=None, compare=False)
 
@@ -200,6 +292,20 @@ class SceneDocument:
 
         jigs = [JigRecord(stl_file=j["stl_file"]) for j in data.get("jigs", [])]
 
+        ppg_grasps = [
+            PPGGraspRecord(
+                part_id=int(g["part_id"]),
+                x_mm=float(g["x_mm"]), y_mm=float(g["y_mm"]), z_mm=float(g["z_mm"]),
+                jaw_bottom_z_mm=float(g["jaw_bottom_z_mm"]),
+                angle_rad=float(g["angle_rad"]),
+                width_mm=float(g["width_mm"]),
+                jaw_width_mm=float(g["jaw_width_mm"]),
+                jaw_height_mm=float(g["jaw_height_mm"]),
+                jaw_thickness_mm=float(g["jaw_thickness_mm"]),
+            )
+            for g in data.get("ppg_grasps", [])
+        ]
+
         background = [
             BackgroundRecord(
                 file=b["file"],
@@ -209,6 +315,40 @@ class SceneDocument:
             )
             for b in data.get("background", [])
         ]
+
+        overrides = [
+            GraspOverride(
+                part_id=int(o["part_id"]),
+                tool=o.get("tool", "vacuum"),
+                dx_mm=float(o.get("dx_mm", 0.0)),
+                dy_mm=float(o.get("dy_mm", 0.0)),
+                dz_mm=float(o.get("dz_mm", 0.0)),
+                width_mm=float(o.get("width_mm", 0.0)),
+                angle_rad=(float(o["angle_rad"]) if "angle_rad" in o else None),
+            )
+            for o in data.get("grasp_overrides", [])
+        ]
+
+        tools = {
+            k: ToolModel(
+                body_file=t["body_file"],
+                origin_dz_mm=float(t.get("origin_dz_mm", 0.0)),
+                jaw_lo_file=t.get("jaw_lo_file", ""),
+                jaw_hi_file=t.get("jaw_hi_file", ""),
+                jaw_lo_inner_mm=float(t.get("jaw_lo_inner_mm", 0.0)),
+                jaw_hi_inner_mm=float(t.get("jaw_hi_inner_mm", 0.0)),
+                jaw_bottom_dz_mm=float(t.get("jaw_bottom_dz_mm", 0.0)),
+                arm_length_mm=float(t.get("arm_length_mm", 0.0)),
+                arms=[
+                    ToolArm(file=a["file"], sign=int(a["sign"]),
+                            pivot_x_mm=float(a["pivot_x_mm"]),
+                            pivot_z_mm=float(a["pivot_z_mm"]),
+                            length_mm=float(a["length_mm"]))
+                    for a in t.get("arms", [])
+                ],
+            )
+            for k, t in (data.get("tools") or {}).items()
+        }
 
         return cls(
             version=data["version"],
@@ -223,6 +363,9 @@ class SceneDocument:
             command_file=data.get("command_file", ""),
             background=background,
             nozzle_file=data.get("nozzle_file", ""),
+            ppg_grasps=ppg_grasps,
+            grasp_overrides=overrides,
+            tools=tools,
             arms_path=arms_path,
         )
 
@@ -259,6 +402,41 @@ class SceneDocument:
             raise RuntimeError("SceneDocument was not loaded from a .arms file")
         with zipfile.ZipFile(self.arms_path, "r") as zf:
             return zf.read(entry_name)
+
+    def tool_mesh(self, entry_name: str) -> tuple[np.ndarray, np.ndarray]:
+        """Vertices (metres) and triangles for a baked tool GLB."""
+        return _parse_glb(self.read_entry(entry_name))
+
+    def write_overrides(self, overrides: list[GraspOverride]) -> None:
+        """Store grasp edits back into the .arms file.
+
+        Written as a separate `grasp_overrides` key rather than by rewriting the
+        planner's own grasp arrays, so what the planner decided and what a person
+        changed stay distinguishable.  Zip entries have to be copied to a new
+        archive because zipfile cannot replace one in place.
+        """
+        if self.arms_path is None:
+            raise RuntimeError("SceneDocument was not loaded from a .arms file")
+
+        with zipfile.ZipFile(self.arms_path, "r") as zf:
+            entries = {n: zf.read(n) for n in zf.namelist()}
+
+        manifest = json.loads(entries["manifest.json"])
+        manifest["grasp_overrides"] = [
+            {"part_id": o.part_id, "tool": o.tool,
+             "dx_mm": o.dx_mm, "dy_mm": o.dy_mm, "dz_mm": o.dz_mm,
+             "width_mm": o.width_mm,
+             **({"angle_rad": o.angle_rad} if o.angle_rad is not None else {})}
+            for o in overrides
+        ]
+        entries["manifest.json"] = json.dumps(manifest).encode()
+
+        tmp = self.arms_path + ".tmp"
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+            for name, blob in entries.items():
+                out.writestr(name, blob)
+        os.replace(tmp, self.arms_path)
+        self.grasp_overrides = list(overrides)
 
     def part_by_id(self, part_id: int) -> Optional[PartRecord]:
         for p in self.parts:

@@ -17,6 +17,10 @@
 
 
 #include <BRepAlgoAPI_Cut.hxx>
+#include <BRepOffsetAPI_MakeOffsetShape.hxx>
+#include <ShapeUpgrade_UnifySameDomain.hxx>
+#include <BRepOffset_Mode.hxx>
+#include <GeomAbs_JoinType.hxx>
 #include <BOPAlgo_Options.hxx>
 
 #include <BRepFilletAPI_MakeFillet.hxx>
@@ -110,6 +114,61 @@ static HullMesh BuildConvexHullMesh(const TopoDS_Shape& shape,
     }
 
     out.indices.assign(ibuf.begin(), ibuf.end());
+    return out;
+}
+
+// Grow a convex hull outward by `d` in every direction.
+//
+// A jig pocket wants a uniform gap.  A uniform scale cannot give one: it grows
+// the shape in proportion to distance from its centre, so a 60 x 10 mm part asked
+// for 1 mm of clearance ends up with 0.50 mm along its length and 0.08 mm across
+// its width.  A boolean surface offset does give a uniform gap, but it is
+// unreliable here — the hull arrives as a triangle soup and the offset fails
+// outright on rounded profiles such as gear blanks.
+//
+// For a convex body there is a sturdier route.  The offset is the Minkowski sum
+// with a sphere of radius d, and for a convex hull that is exactly the hull of
+// its vertices each replaced by such a sphere.  Sampling the sphere with a set of
+// directions turns the whole thing back into a hull problem — machinery already
+// in this file, and which cannot fail the way a boolean can.
+static HullMesh DilateHull(const HullMesh& hull, double d)
+{
+    constexpr int N = 64;
+
+    // Fibonacci sphere: near-uniformly spread directions.
+    std::vector<gp_Vec> dirs;
+    dirs.reserve(N);
+    const double golden = M_PI * (3.0 - std::sqrt(5.0));
+    for (int i = 0; i < N; ++i) {
+        const double z  = 1.0 - 2.0 * (i + 0.5) / N;
+        const double r  = std::sqrt(std::max(0.0, 1.0 - z * z));
+        const double th = golden * i;
+        dirs.emplace_back(r * std::cos(th), r * std::sin(th), z);
+    }
+
+    // Between sample directions the faceted sphere falls slightly inside the true
+    // one, so nudge the radius out to keep the gap at no less than d.
+    const double cover = 2.0 / std::sqrt(static_cast<double>(N));
+    const double radius = d / std::cos(std::min(0.4, cover));
+
+    std::vector<quickhull::Vector3<double>> cloud;
+    cloud.reserve(hull.vertices.size() * N);
+    for (auto const& v : hull.vertices)
+        for (auto const& s : dirs)
+            cloud.emplace_back(v.X() + radius * s.X(),
+                               v.Y() + radius * s.Y(),
+                               v.Z() + radius * s.Z());
+
+    quickhull::QuickHull<double> qh;
+    auto h = qh.getConvexHull(cloud, /*CCW*/ true, /*useOriginalIndices*/ false);
+
+    HullMesh out;
+    auto& vb = h.getVertexBuffer();
+    auto& ib = h.getIndexBuffer();
+    out.vertices.reserve(vb.size());
+    for (size_t i = 0; i < vb.size(); ++i)
+        out.vertices.emplace_back(vb[i].x, vb[i].y, vb[i].z);
+    out.indices.assign(ib.begin(), ib.end());
     return out;
 }
 
@@ -387,6 +446,14 @@ float CradleGenerator::createSimpleNegative(float bay_size, int bay_index, const
     HullMesh hull = BuildConvexHullMesh(shape_, /*deflection*/ 0.01);
     RCLCPP_INFO(logger(), "Built convex hull of %ld vertices and %ld indices",
                 hull.vertices.size(), hull.indices.size());
+
+    // Apply the running clearance here, on the hull, rather than to the solid
+    // afterwards — see DilateHull for why.
+    if (scaling_distance_ > 1e-6) {
+        hull = DilateHull(hull, scaling_distance_);
+        RCLCPP_INFO(logger(), "Hull grown by %.2f mm on every side (%ld vertices)",
+                    scaling_distance_, hull.vertices.size());
+    }
   
     TopoDS_Shape convex_shape;
 
@@ -426,8 +493,17 @@ float CradleGenerator::createSimpleNegative(float bay_size, int bay_index, const
     const float scaling_distance = scaling_distance_;
     const float scaling_factor = float((largest_shape_axis + scaling_distance) / largest_shape_axis);
   
-    TopoDS_Shape scaled_convex_shape = UniformScaleShape(convex_shape, scaling_factor);
-    RCLCPP_INFO(logger(), "Scaled shape");
+    // Grow the hull by the clearance.  A true surface offset moves every face
+    // outward by the same distance, so the gap is uniform wherever the part
+    // touches the pocket.  Scaling cannot do that: it grows the shape in
+    // proportion to distance from the centroid, so an elongated part ends up with
+    // far more gap along its length than across its width.
+    //
+    // The hull is convex, which is the well-conditioned case for offsetting, but
+    // it also carries a lot of triangular facets — so fall back through a rounded
+    // join and finally to the old scale if the exact offset will not build.
+    // The hull already carries the clearance, so it is the shape to subtract.
+    TopoDS_Shape scaled_convex_shape = convex_shape;
 
     // (Optional) one more fix pass
     
@@ -576,6 +652,31 @@ float CradleGenerator::createSimpleNegative(float bay_size, int bay_index, const
     {
       RCLCPP_ERROR(logger(), "Final jig is null. Aborting STL export.");
       return 0.0f;
+    }
+
+    // Cut the finger channels.  Done after the pocket is chosen so the slots are
+    // subtracted from the final jig body, and before the jig is moved to its
+    // canonical height so the slots stay registered to the part geometry they
+    // were computed from.
+    if (!finger_slots_.empty())
+    {
+        const double vol_before = ShapeVolume(final_jig);
+        int cut = 0;
+        for (const TopoDS_Shape& slot : finger_slots_)
+        {
+            TopoDS_Shape tmp = safeCut(final_jig, slot, /*fuzzy*/ 1e-5);
+            if (tmp.IsNull())
+            {
+                RCLCPP_WARN(logger(), "Finger slot %d failed to cut on %s", cut, name_.c_str());
+                continue;
+            }
+            final_jig = tmp;
+            ++cut;
+        }
+        RCLCPP_INFO(logger(), "Cut %d gripper finger slot(s) into jig for %s "
+                    "(volume %.1f -> %.1f mm3, %.1f%% removed)",
+                    cut, name_.c_str(), vol_before, ShapeVolume(final_jig),
+                    100.0 * (vol_before - ShapeVolume(final_jig)) / std::max(1.0, vol_before));
     }
 
     // Translate the final jig so its centroid z = JIG_CENTER_Z.

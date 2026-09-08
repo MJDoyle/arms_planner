@@ -49,11 +49,11 @@ void GCodeGenerator::generate(std::shared_ptr<Assembly> initial_assembly,
         {
             gp_Pnt initial_transform = initial_assembly->getUnassembledPartTransforms()[part];
 
-            gp_Vec pick_position = SumPoints(initial_transform, part->getVacuumGrasp());
+            gp_Vec pick_position = SumPoints(initial_transform, part->getGraspOffset());
 
             RCLCPP_INFO(logger(), "Pick transform: %f %f %f grasp %f %f %f", initial_transform.X(), initial_transform.Y(), initial_transform.Z(), part->getVacuumGrasp().X(), part->getVacuumGrasp().Y(), part->getVacuumGrasp().Z());
 
-            gp_Vec place_position = SumPoints(target_assembly->getAssembledPartTransforms()[part], part->getVacuumGrasp());
+            gp_Vec place_position = SumPoints(target_assembly->getAssembledPartTransforms()[part], part->getGraspOffset());
 
             gcode.push_back(";PLACE EXTERNAL PART COMMAND " + part->getName());
 
@@ -63,7 +63,21 @@ void GCodeGenerator::generate(std::shared_ptr<Assembly> initial_assembly,
 
             homeX(gcode);
 
-            toolChangeVacuum(gcode);
+            const bool use_gripper = (part->getGraspTool() == Part::GraspTool::PPG);
+            if (use_gripper)
+            {
+                const PPGGrasp& g = part->getPPGGrasp();
+                gcode.push_back(";  using parallel plate gripper");
+                toolChangeGripper(gcode);
+                // Align the jaws to the grasp axis and open them clear of the part
+                // before descending into the jig's finger slots.
+                gcode.push_back("GRIPPER_ROTATE A=" + std::to_string(g.rotation_ * 180.0 / M_PI));
+                gcode.push_back("GRIPPER_OPEN W=" + std::to_string(g.width_ + 6.0));
+            }
+            else
+            {
+                toolChangeVacuum(gcode);
+            }
 
             moveToSafeHeight(gcode);
 
@@ -71,7 +85,10 @@ void GCodeGenerator::generate(std::shared_ptr<Assembly> initial_assembly,
 
             moveToHeight(gcode, pick_position.Z() - 2, 2000);    //Including offset for vacuum nozzle     //TODO need to check this
 
-            vacuumOn(gcode);
+            if (use_gripper)
+                gcode.push_back("GRIPPER_CLOSE W=" + std::to_string(part->getPPGGrasp().width_));
+            else
+                vacuumOn(gcode);
 
             wait(gcode, 500);
 
@@ -81,7 +98,10 @@ void GCodeGenerator::generate(std::shared_ptr<Assembly> initial_assembly,
 
             moveToHeight(gcode, place_position.Z() - 2, 2000);    //Including offset for vacuum nozzle
 
-            vacuumOff(gcode);
+            if (use_gripper)
+                gcode.push_back("GRIPPER_OPEN W=" + std::to_string(part->getPPGGrasp().width_ + 6.0));
+            else
+                vacuumOff(gcode);
 
             wait(gcode, 500);
 
