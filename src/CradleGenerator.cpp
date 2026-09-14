@@ -531,6 +531,7 @@ float CradleGenerator::createSimpleNegative(float bay_size, int bay_index, const
     // Once the jig top reaches the part's centre of mass, it captures enough geometry for
     // lateral stability; stepping higher only makes the jig unnecessarily deep.
     const double shape_centroid_z = ShapeCentroid(shape_).Z();
+    const double hull_lowest_z = ShapeLowestPoint(scaled_convex_shape);
 
     int i = -1;
     for (float z = ShapeLowestPoint(shape_) - (JIG_HEIGHT * 0.5f + 1.0f);
@@ -641,7 +642,8 @@ float CradleGenerator::createSimpleNegative(float bay_size, int bay_index, const
           continue;
         }
       }
-      if (!any_downward_face_above_jig)
+      const double hull_depth = jig_top - hull_lowest_z;
+      if (!any_downward_face_above_jig && hull_depth >= 2.0)
       {
         RCLCPP_INFO(logger(), "No downward-facing part faces above jig top (%.3f mm), stopping early", jig_top);
         break;

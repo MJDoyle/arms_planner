@@ -74,19 +74,11 @@ const std::vector<std::vector<gp_Pnt>> PARTS_BAY_POSITIONS = {{gp_Pnt(377, 190, 
 
 const std::vector<int> BAY_SIZES = {40, 60};
 
-// Printable area, in machine coordinates (mm).  These MUST match bed_shape in
-// config/arms_prusa_config.ini — arrangeInternalParts() packs internal parts
-// within these bounds, and alignAssemblyPathToInitialAssembly() then moves the
-// whole target assembly onto the base part wherever it was placed.  So bounds
-// that don't match the real bed put both the printed parts and the assembled
-// parts off the machine.
-// Current bed_shape = 20x75,250x75,250x250,20x250.
-const double PRINT_BED_BOTTOM_LEFT[2] = {20, 75};
+const double PRINT_BED_CENTER[2] = {95, 12.5};
 
-const double PRINT_BED_TOP_RIGHT[2] = {250, 250};
+const double PRINT_BED_BOTTOM_LEFT[2] = {-20, -75};
 
-const double PRINT_BED_CENTER[2] = {(PRINT_BED_BOTTOM_LEFT[0] + PRINT_BED_TOP_RIGHT[0]) * 0.5,
-                                    (PRINT_BED_BOTTOM_LEFT[1] + PRINT_BED_TOP_RIGHT[1]) * 0.5};
+const double PRINT_BED_TOP_RIGHT[2] = {210, 100};
 
 const double PRINT_MIN_SPACING = 20;
 
