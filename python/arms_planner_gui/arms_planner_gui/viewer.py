@@ -347,6 +347,8 @@ class _ViewerState:
         self.edit_defaults: dict[int, dict]       = {}
         self.edit_handles: list                   = []   # gizmos + preview markers
         self.edit_nodes:   dict                   = {}   # (part_id, end) -> handles
+        # When set, only this part's grasp is drawn in edit mode — at both ends.
+        self.edit_focus:   int | None             = None
         self.on_edit_changed = None                      # set by the app
         self.show_jigs     = True
         self.show_background = True
@@ -837,8 +839,15 @@ class _ViewerState:
                 )
                 self.edit_handles.extend(tool_handles)
                 self.edit_handles.append(ctrl)
+                # Each tool piece sits off the grasp point by the model's own
+                # drop (and, for a gripper, the jaw and linkage lift).  Record
+                # that offset so a drag carries it along instead of snapping
+                # every piece onto the bare grasp point.
+                anchor = np.asarray(self._p(*world), dtype=np.float64)
+                deltas = [np.asarray(h.position, dtype=np.float64) - anchor
+                          for h in tool_handles]
                 self.edit_nodes[(part_id, end)] = {"gizmo": ctrl, "tools": tool_handles,
-                                                   "base": base}
+                                                   "deltas": deltas, "base": base}
 
                 @ctrl.on_update
                 def _(handle, _pid=part_id, _end=end, _base=base) -> None:
@@ -853,6 +862,16 @@ class _ViewerState:
                     self.sync_edit_positions(_pid, skip_end=_end)
                     if self.on_edit_changed:
                         self.on_edit_changed()
+
+        self.apply_edit_visibility()
+
+    def apply_edit_visibility(self) -> None:
+        """Show every editable grasp, or only the focused one at pick and place."""
+        for (part_id, _end), node in self.edit_nodes.items():
+            vis = self.edit_focus is None or part_id == self.edit_focus
+            node["gizmo"].visible = vis
+            for h in node["tools"]:
+                h.visible = vis
 
     def sync_edit_positions(self, part_id: int, skip_end: str | None = None) -> None:
         """Reposition a grasp's handles from its current offset.
@@ -869,8 +888,9 @@ class _ViewerState:
                 continue
             base = node["base"]
             pos = self._p(base.x + off[0], base.y + off[1], base.z + off[2])
-            for h in node["tools"]:
-                h.position = pos
+            anchor = np.asarray(pos, dtype=np.float64)
+            for h, d in zip(node["tools"], node["deltas"]):
+                h.position = tuple((anchor + d).tolist())
             if end != skip_end:
                 node["gizmo"].position = pos
 
@@ -1484,6 +1504,9 @@ class ARMSPlannerApp:
         self._clear_edit_gui()
         part_map = {p.part_id: p for p in state.doc.parts}
         self._edit_syncing = False
+        # The focus checkbox is recreated unticked, so start with every grasp shown.
+        state.edit_focus = None
+        state.apply_edit_visibility()
 
         labels = {}
         for part_id in sorted(state.edit_offsets):
@@ -1497,6 +1520,9 @@ class ARMSPlannerApp:
         with self._edit_folder:
             self._edit_part_dd = self.server.gui.add_dropdown(
                 "Grasp", options=tuple(labels.keys()), initial_value=next(iter(labels))
+            )
+            self._edit_focus_cb = self.server.gui.add_checkbox(
+                "Show selected grasp only", initial_value=False
             )
             self._edit_tool_dd = self.server.gui.add_dropdown(
                 "Tool", options=("vacuum", "gripper"), initial_value="vacuum"
@@ -1517,7 +1543,7 @@ class ARMSPlannerApp:
             self._edit_reset_btn = self.server.gui.add_button("Reset to planner")
             self._edit_nudge = self.server.gui.add_number("Nudge step (mm)", 1.0, min=0.01, step=0.1)
 
-        self._edit_children = [self._edit_part_dd, self._edit_tool_dd,
+        self._edit_children = [self._edit_part_dd, self._edit_focus_cb, self._edit_tool_dd,
                                self._edit_x, self._edit_y, self._edit_z,
                                self._edit_width, self._edit_angle,
                                self._edit_reset_btn, self._edit_nudge]
@@ -1539,9 +1565,19 @@ class ARMSPlannerApp:
         for fld in (self._edit_x, self._edit_y, self._edit_z):
             fld.on_update(apply_numbers)
 
+        def apply_focus() -> None:
+            state.edit_focus = (self._selected_edit_part()
+                                if self._edit_focus_cb.value else None)
+            state.apply_edit_visibility()
+
         @self._edit_part_dd.on_update
         def _(_: viser.GuiEvent) -> None:
             self._sync_edit_fields()
+            apply_focus()
+
+        @self._edit_focus_cb.on_update
+        def _(_: viser.GuiEvent) -> None:
+            apply_focus()
 
         @self._edit_tool_dd.on_update
         def _(_: viser.GuiEvent) -> None:
